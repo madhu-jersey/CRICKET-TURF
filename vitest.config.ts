@@ -9,10 +9,10 @@ export default defineConfig({
     },
   },
   test: {
-    include: ["tests/unit/**/*.test.ts", "tests/integration/**/*.test.ts"],
+    include: ["tests/unit/**/*.test.ts", "tests/integration/**/*.test.ts", "tests/security/**/*.test.ts"],
     environment: "node",
     testTimeout: 60000,
     hookTimeout: 60000,
-    env: { APP_SECRET: "test-secret-please-change", DEMO_MODE: "true", MESSAGE_RETRY_BASE_MS: "1" },
+    env: { APP_SECRET: "test-secret-please-change", DEMO_MODE: "true", MESSAGE_RETRY_BASE_MS: "1", BCRYPT_COST: "4" },
   },
 });

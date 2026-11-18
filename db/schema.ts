@@ -66,6 +66,9 @@ export const customers = pgTable("Customer", {
   phone: text("phone").notNull(),
   whatsappOptIn: boolean("whatsappOptIn").notNull().default(false),
   optInAt: ts("optInAt"),
+  isBlocked: boolean("isBlocked").notNull().default(false),
+  blockedAt: ts("blockedAt"),
+  blockedReason: text("blockedReason"),
   createdAt: ts("createdAt").notNull().defaultNow(),
 });
 
@@ -180,6 +183,10 @@ export const settings = pgTable("Settings", {
   refundPercentBeforeCutoff: integer("refundPercentBeforeCutoff").notNull(),
   maxDaysAhead: integer("maxDaysAhead").notNull(),
   newCustomerDiscountPercent: integer("newCustomerDiscountPercent").notNull().default(10),
+  maxActiveBookingsPerPhone: integer("maxActiveBookingsPerPhone").notNull().default(2),
+  maxBookingsPerPhonePerDay: integer("maxBookingsPerPhonePerDay").notNull().default(4),
+  noShowBlockThreshold: integer("noShowBlockThreshold").notNull().default(3),
+  otpDailyCap: integer("otpDailyCap").notNull().default(300),
   ownerAlertPhone: text("ownerAlertPhone"),
   businessName: text("businessName").notNull(),
   address: text("address").notNull(),

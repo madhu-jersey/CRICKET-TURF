@@ -13,6 +13,8 @@ import { CancelBooking } from "@/components/booking/cancel-booking";
 import { ButtonLink } from "@/components/ui/button";
 import { Alert } from "@/components/ui/field";
 import { inr } from "@/lib/utils";
+import { headers } from "next/headers";
+import { hitRateLimit, ipFromHeaders } from "@/lib/ratelimit";
 
 export const dynamic = "force-dynamic";
 export const metadata: Metadata = { title: "Your booking", robots: { index: false } };
@@ -37,6 +39,8 @@ export default async function BookingPage({ params, searchParams }: { params: Pr
   const parsed = bookingCodeSchema.safeParse((await params).code);
   if (!parsed.success) notFound();
   const code = parsed.data;
+  // Booking pages are reachable by code; cap views per network so codes can't be scanned. [SEC-11]
+  if (!(await hitRateLimit(`booking-view:${ipFromHeaders(await headers())}`, 60, 10 * 60_000))) notFound();
   const d = await getBookingByCode(code);
   if (!d) notFound();
   const { paid: justPaid } = await searchParams;
@@ -46,6 +50,8 @@ export default async function BookingPage({ params, searchParams }: { params: Pr
   const hold = holdAlive ? await holdResponseFor(code, null).catch(() => null) : null;
   const paidOnline = netPaid(d.payments.filter((p) => p.kind === "ADVANCE"));
   const verifiedPhone = await getVerifiedPhone();
+  // Anyone with the code sees only first name + masked phone; the verified owner sees their full name. [SEC-05]
+  const isOwner = verifiedPhone === d.customer.phone;
   const refundPreview = b.status === "CONFIRMED" && b.startAt > now ? await previewCustomerRefund(code, now) : null;
   const qr = await QRCode.toString(code, { type: "svg", margin: 1, color: { dark: "#0c1510", light: "#ffffff" } });
   const sportLabel = siteConfig.sports[d.sport].label;
@@ -86,7 +92,7 @@ export default async function BookingPage({ params, searchParams }: { params: Pr
               <div><dt className="text-zinc-500">Court</dt><dd className="font-semibold">{d.courtName}</dd></div>
               <div><dt className="text-zinc-500">Date</dt><dd className="font-semibold">{formatDate(b.startAt)}</dd></div>
               <div><dt className="text-zinc-500">Time</dt><dd className="font-semibold">{when}</dd></div>
-              <div><dt className="text-zinc-500">Name</dt><dd className="font-semibold">{d.customer.name}</dd></div>
+              <div><dt className="text-zinc-500">Name</dt><dd className="font-semibold">{isOwner ? d.customer.name : d.customer.name.split(" ")[0]}</dd></div>
               <div><dt className="text-zinc-500">Phone</dt><dd className="font-semibold">{maskPhone(d.customer.phone)}</dd></div>
               <div><dt className="text-zinc-500">Total</dt><dd className="font-semibold">{inr(b.totalAmount)}{b.discountAmount > 0 && <span className="block text-xs font-semibold text-emerald-700">You saved {inr(b.discountAmount)} (first booking)</span>}</dd></div>
               <div><dt className="text-zinc-500">{b.status === "PENDING_PAYMENT" ? "Advance due" : "Paid online"}</dt><dd className="font-semibold">{inr(b.status === "PENDING_PAYMENT" ? b.advanceAmount : paidOnline)}</dd></div>

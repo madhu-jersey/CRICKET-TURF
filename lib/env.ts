@@ -13,15 +13,17 @@ export const env = {
   get demoMode() {
     return str("DEMO_MODE", "true") !== "false";
   },
+  /**
+   * Signs the verified-phone cookie, hashes OTPs and derives mock-payment secrets. In production it
+   * is always required (demo or not): a known fallback would let anyone forge phone tokens. [SEC-02]
+   */
   get appSecret() {
     const s = str("APP_SECRET");
-    if (!s) {
-      if (process.env.NODE_ENV === "production" && str("DEMO_MODE", "true") === "false") {
-        throw new Error("APP_SECRET must be set in production");
-      }
-      return "dev-only-insecure-secret-change-me";
+    if (process.env.NODE_ENV === "production") {
+      if (s.length < 32) throw new Error("APP_SECRET must be set to a random string of at least 32 characters in production");
+      return s;
     }
-    return s;
+    return s || "dev-only-insecure-secret-change-me";
   },
   get siteUrl() {
     return str("NEXT_PUBLIC_SITE_URL", "http://localhost:3000").replace(/\/$/, "");
@@ -51,5 +53,10 @@ export const env = {
 
 /** The mock OTP provider (code shown on screen) is only allowed outside production or in demo mode. */
 export function mockOtpAllowed() {
+  return !env.isProduction || env.demoMode;
+}
+
+/** Same rule for the mock payment provider ("Simulate success"): never on a live, non-demo site. [SEC-01] */
+export function mockPaymentAllowed() {
   return !env.isProduction || env.demoMode;
 }

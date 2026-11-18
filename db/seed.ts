@@ -102,7 +102,7 @@ export async function seedDatabase(db: DB, now = new Date()) {
     })
     .onConflictDoNothing();
 
-  const hash = await bcrypt.hash("Demo@1234", 10);
+  const hash = await bcrypt.hash("Demo@1234", Number(process.env.BCRYPT_COST) || 12);
   await db
     .insert(schema.adminUsers)
     .values([

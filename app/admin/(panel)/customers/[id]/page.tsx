@@ -5,6 +5,7 @@ import { requireAdminPage } from "@/lib/auth/admin";
 import { getDb, schema } from "@/db/client";
 import { Card, PageHeader } from "@/components/admin/shell";
 import { BookingsTable } from "@/components/admin/bookings-table";
+import { CustomerControls } from "@/components/admin/customer-controls";
 import { formatDate } from "@/lib/time";
 import { inr } from "@/lib/utils";
 
@@ -29,6 +30,7 @@ export default async function CustomerPage({ params }: { params: Promise<{ id: s
     <>
       <Link href="/admin/customers" className="text-sm font-semibold underline">← Customers</Link>
       <PageHeader title={c.name} />
+      <CustomerControls id={c.id} isBlocked={c.isBlocked} blockedReason={c.blockedReason} whatsappOptIn={c.whatsappOptIn} />
       <div className="mb-4 grid grid-cols-2 gap-3 lg:grid-cols-4">
         <Card><p className="text-sm text-zinc-500">Phone</p><a href={`tel:${c.phone}`} className="font-semibold underline">{c.phone}</a></Card>
         <Card><p className="text-sm text-zinc-500">Bookings</p><p className="font-display text-3xl font-bold">{rows.length}</p></Card>

@@ -4,12 +4,16 @@ import { getDb } from "@/db/client";
 import { handle } from "@/lib/errors";
 import { loadAvailability } from "@/lib/booking/data";
 import { dateKeySchema, idSchema } from "@/lib/validation";
+import { AppError } from "@/lib/errors";
+import { clientIp, memoryRateLimit } from "@/lib/ratelimit";
 
 export const dynamic = "force-dynamic";
 
 const q = z.object({ courtId: idSchema, date: dateKeySchema });
 
 export const GET = handle(async (req: Request) => {
+  // Polling is every 30 s per open page; 90/min per network is generous and keeps the DB safe. [SEC-16]
+  if (!memoryRateLimit(`avail:${clientIp(req)}`, 90, 60_000)) throw new AppError("RATE_LIMITED", "Too many requests. Please slow down.");
   const url = new URL(req.url);
   const { courtId, date } = q.parse({ courtId: url.searchParams.get("courtId"), date: url.searchParams.get("date") });
   const a = await loadAvailability(await getDb(), courtId, date, new Date());

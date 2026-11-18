@@ -4,7 +4,7 @@
  * goes through exactly the same server verification and webhook code as the real one.
  */
 import "server-only";
-import { env } from "@/lib/env";
+import { env, mockPaymentAllowed } from "@/lib/env";
 import { hmacHex, randomToken, safeEqual } from "@/lib/security";
 import { AppError } from "@/lib/errors";
 
@@ -115,6 +115,8 @@ export function getPaymentProvider(): PaymentProvider {
   if (env.paymentProvider === "razorpay") {
     cached = new RazorpayProvider(env.str("RAZORPAY_KEY_ID"), env.str("RAZORPAY_KEY_SECRET"), env.str("RAZORPAY_WEBHOOK_SECRET"));
   } else {
+    // Never fall back to the free mock checkout on a live site. [SEC-01]
+    if (!mockPaymentAllowed()) throw new AppError("PROVIDER_ERROR", "Online payments are not configured. Please contact the venue.");
     cached = new MockPaymentProvider(hmacHex(env.appSecret, "mock-key-secret"), hmacHex(env.appSecret, "mock-webhook-secret"));
   }
   return cached;
@@ -122,4 +124,9 @@ export function getPaymentProvider(): PaymentProvider {
 
 export function setPaymentProviderOverride(p: PaymentProvider | undefined) {
   override = p;
+}
+
+/** Test helper: forget the cached provider so the next call re-reads the environment. */
+export function resetPaymentProviderCache() {
+  cached = undefined;
 }

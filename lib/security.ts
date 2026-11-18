@@ -48,3 +48,9 @@ export function verifyToken<T extends { exp: number }>(token: string | undefined
     return null;
   }
 }
+
+/** Phone number safe for logs: +91 98XXXXXX21. [SEC-18] */
+export function maskForLog(phone: string): string {
+  const d = phone.replace(/^[+]91/, "");
+  return d.length === 10 ? "+91 " + d.slice(0, 2) + "XXXXXX" + d.slice(-2) : "[phone]";
+}

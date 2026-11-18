@@ -26,7 +26,7 @@ export default async function BookingsPage({ searchParams }: { searchParams: Pro
   return (
     <>
       <PageHeader title="Bookings">
-        <a href={`/api/admin/bookings/export${exportQs ? `?${exportQs}` : ""}`} className="rounded-full border border-zinc-300 bg-white px-4 py-2 text-sm font-bold">Export CSV</a>
+        {admin.role === "OWNER" && <a href={`/api/admin/bookings/export${exportQs ? `?${exportQs}` : ""}`} className="rounded-full border border-zinc-300 bg-white px-4 py-2 text-sm font-bold">Export CSV</a>}
         <Link href="/admin/walk-in" className="rounded-full bg-ink px-4 py-2 text-sm font-bold text-flood">+ Walk-in</Link>
       </PageHeader>
       {sp.denied && <Alert tone="warn" className="mb-4">That page is for the owner only.</Alert>}

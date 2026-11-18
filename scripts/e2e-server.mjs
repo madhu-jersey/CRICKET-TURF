@@ -11,7 +11,8 @@ const env = {
   PAYMENT_PROVIDER: "mock",
   MESSAGING_PROVIDER: "mock",
   OTP_PROVIDER: "mock",
-  APP_SECRET: "e2e-secret-not-for-production",
+  APP_SECRET: "e2e-secret-not-for-production-0123456789abcdef",
+  CRON_SECRET: "e2e-cron-secret-0123456789",
   NEXT_PUBLIC_SITE_URL: "http://localhost:3100",
   MESSAGE_RETRY_BASE_MS: "50",
   // Every e2e test verifies a phone from localhost; lift the per-network OTP cap for the suite only.

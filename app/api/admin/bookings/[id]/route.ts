@@ -6,6 +6,7 @@ import { adminRoute } from "@/lib/admin/route";
 import { getBookingById, netPaid } from "@/lib/booking/data";
 import { cancelBooking, markBalancePaid, notifyConfirmed, refundCancelledBooking, setBookingOutcome } from "@/lib/booking/service";
 import { getDb, schema } from "@/db/client";
+import { enforceRateLimit } from "@/lib/ratelimit";
 
 type P = { id: string };
 
@@ -40,6 +41,7 @@ export const POST = adminRoute<P>("STAFF", async (req, { admin }, { id }) => {
       await setBookingOutcome(id, "NO_SHOW", actor);
       break;
     case "resend": {
+      await enforceRateLimit(`resend:${id}`, 3, 60 * 60_000, "This confirmation was resent recently. Try again later.");
       const d = await getBookingById(id);
       if (!d || d.booking.status !== "CONFIRMED") throw new AppError("NOT_ALLOWED", "Only confirmed bookings can be resent.");
       if (!d.customer.whatsappOptIn) throw new AppError("NOT_ALLOWED", "This customer hasn't opted in to WhatsApp messages.");
@@ -47,6 +49,8 @@ export const POST = adminRoute<P>("STAFF", async (req, { admin }, { id }) => {
       break;
     }
     case "cancel": {
+      // Staff can cancel, but giving money back is the owner's decision. [SEC-14]
+      if (a.refundMode !== "NONE" && admin.role !== "OWNER") throw new AppError("FORBIDDEN", "Only the owner can cancel with a refund.");
       const r = await cancelBooking({
         bookingId: id,
         actor,

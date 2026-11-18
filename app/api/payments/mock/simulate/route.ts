@@ -6,6 +6,7 @@ import { checkoutSignature, getPaymentProvider, webhookSignature, type MockPayme
 import { handlePaymentWebhook } from "@/lib/booking/service";
 import { randomToken } from "@/lib/security";
 import { getDb, schema } from "@/db/client";
+import { mockPaymentAllowed } from "@/lib/env";
 
 const body = z.object({ orderId: z.string().min(1).max(100), outcome: z.enum(["success", "failure"]) });
 
@@ -15,6 +16,8 @@ const body = z.object({ orderId: z.string().min(1).max(100), outcome: z.enum(["s
  * browser sends to /api/payments/verify — the same path a real payment takes.
  */
 export const POST = handle(async (req: Request) => {
+  // Double gate: demo/dev only AND the mock provider is the active one. [SEC-01]
+  if (!mockPaymentAllowed()) throw new AppError("NOT_FOUND", "Not available");
   const provider = getPaymentProvider();
   if (provider.name !== "mock") throw new AppError("NOT_FOUND", "Not available");
   const mock = provider as MockPaymentProvider;

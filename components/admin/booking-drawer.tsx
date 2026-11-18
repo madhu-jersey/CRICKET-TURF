@@ -30,7 +30,7 @@ export function BookingDrawer({ id, onClose, role }: { id: string | null; onClos
   const [busy, setBusy] = useState<string | null>(null);
   const [mode, setMode] = useState("CASH");
   const [cancelOpen, setCancelOpen] = useState(false);
-  const [refundMode, setRefundMode] = useState<"FULL" | "PARTIAL" | "NONE">("FULL");
+  const [refundMode, setRefundMode] = useState<"FULL" | "PARTIAL" | "NONE">(role === "OWNER" ? "FULL" : "NONE");
   const [refundAmt, setRefundAmt] = useState("");
   const [reason, setReason] = useState("");
 
@@ -148,7 +148,8 @@ export function BookingDrawer({ id, onClose, role }: { id: string | null; onClos
                 >
                   <fieldset>
                     <legend className="mb-2 text-sm font-semibold">Refund ({inr(d.paid)} collected)</legend>
-                    {(["FULL", "PARTIAL", "NONE"] as const).map((m) => (
+                    {role !== "OWNER" && <p className="mb-2 text-xs text-zinc-600">Only the owner can give refunds.</p>}
+                    {(role === "OWNER" ? (["FULL", "PARTIAL", "NONE"] as const) : (["NONE"] as const)).map((m) => (
                       <label key={m} className="mr-4 inline-flex items-center gap-1.5 text-sm">
                         <input type="radio" name="refund" value={m} checked={refundMode === m} onChange={() => setRefundMode(m)} />
                         {m === "FULL" ? "Full" : m === "PARTIAL" ? "Partial" : "No refund"}

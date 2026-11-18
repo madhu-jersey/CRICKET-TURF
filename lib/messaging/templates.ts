@@ -8,7 +8,8 @@ export type TemplateName =
   | "booking_reminder"
   | "booking_cancelled"
   | "payment_failed_hold_expiring"
-  | "admin_new_booking";
+  | "admin_new_booking"
+  | "admin_alert";
 
 type Lang = "en" | "te";
 type Def = { params: string[]; render: Record<Lang, (p: Record<string, string>) => string> };
@@ -51,6 +52,13 @@ export const TEMPLATES: Record<TemplateName, Def> = {
       te: (p) => `నమస్తే ${p.name}, బుకింగ్ ${p.code} చెల్లింపు విఫలమైంది. మీ స్లాట్ ఇంకా ${p.minutes} నిమిషాలు ఉంచబడుతుంది — ఇక్కడ మళ్లీ ప్రయత్నించండి: ${p.link}`,
     },
   },
+  admin_alert: {
+    params: ["text"],
+    render: {
+      en: (p) => `⚠️ Boundary Box Arena alert: ${p.text}`,
+      te: (p) => `⚠️ Boundary Box Arena హెచ్చరిక: ${p.text}`,
+    },
+  },
   admin_new_booking: {
     params: ["code", "name", "phone", "court", "date", "time", "amount", "source"],
     render: {
@@ -60,10 +68,29 @@ export const TEMPLATES: Record<TemplateName, Def> = {
   },
 };
 
-export function renderTemplate(name: TemplateName, params: Record<string, string>, lang: Lang = "en"): string {
+export function renderTemplateUnsafe(name: TemplateName, params: Record<string, string>, lang: Lang = "en"): string {
   return TEMPLATES[name].render[lang](params);
 }
 
+/**
+ * WhatsApp template parameters must be single-line text. User-supplied values (names) are
+ * flattened, length-capped and stripped of link markers so they can't break the template or
+ * smuggle a clickable link into a business message. [SEC-15]
+ */
+export function cleanParam(value: string, key?: string): string {
+  let v = String(value ?? "").replace(/[\r\n\t]+/g, " ").replace(/ {2,}/g, " ").trim();
+  if (key === "name") v = v.replace(/https?:\/\//gi, "").replace(/\bwww\./gi, "").replace(/[<>{}]/g, "");
+  return v.slice(0, key === "text" ? 200 : 120);
+}
+
+export function cleanParams(params: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(Object.entries(params).map(([k, v]) => [k, cleanParam(v, k)]));
+}
+
+export function renderTemplate(name: TemplateName, params: Record<string, string>, lang: "en" | "te" = "en"): string {
+  return renderTemplateUnsafe(name, cleanParams(params), lang);
+}
+
 export function orderedParams(name: TemplateName, params: Record<string, string>): string[] {
-  return TEMPLATES[name].params.map((k) => params[k] ?? "");
+  return TEMPLATES[name].params.map((k) => cleanParam(params[k] ?? "", k));
 }

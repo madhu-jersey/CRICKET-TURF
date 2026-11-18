@@ -4,6 +4,7 @@
  */
 import "server-only";
 import { env } from "@/lib/env";
+import { maskForLog } from "@/lib/security";
 import { orderedParams, type TemplateName } from "@/lib/messaging/templates";
 
 export type OutgoingMessage = {
@@ -28,7 +29,8 @@ export class MockProvider implements MessagingProvider {
       this.failNext--;
       throw new Error("Mock provider simulated failure");
     }
-    if (process.env.NODE_ENV !== "test") console.info(`[whatsapp:mock] → ${msg.to} [${msg.template}] ${msg.text.replace(/\n/g, " | ")}`);
+    // Masked number, no message body (which can contain an OTP code). [SEC-18]
+    if (process.env.NODE_ENV !== "test") console.info(`[whatsapp:mock] → ${maskForLog(msg.to)} [${msg.template}]`);
     return { providerMessageId: `mock_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`, mocked: true };
   }
 }

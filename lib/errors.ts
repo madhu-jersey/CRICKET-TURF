@@ -71,9 +71,21 @@ export function handle<A extends unknown[]>(fn: (...args: A) => Promise<Response
   };
 }
 
+/** Largest JSON body any public or admin endpoint accepts (our biggest real payload is < 4 KB). [SEC-19] */
+export const MAX_JSON_BYTES = 32 * 1024;
+
 export async function readJson(req: Request): Promise<unknown> {
+  const declared = Number(req.headers.get("content-length") ?? 0);
+  if (declared > MAX_JSON_BYTES) throw new AppError("VALIDATION", "Request is too large.");
+  let text: string;
   try {
-    return await req.json();
+    text = await req.text();
+  } catch {
+    throw new AppError("VALIDATION", "Invalid JSON body");
+  }
+  if (text.length > MAX_JSON_BYTES) throw new AppError("VALIDATION", "Request is too large.");
+  try {
+    return JSON.parse(text);
   } catch {
     throw new AppError("VALIDATION", "Invalid JSON body");
   }

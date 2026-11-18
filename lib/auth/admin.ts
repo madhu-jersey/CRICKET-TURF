@@ -17,6 +17,11 @@ import { audit } from "@/lib/audit";
 import type { AdminRole, AdminUser } from "@/db/schema";
 
 export const ADMIN_COOKIE = "bba_admin";
+
+/** bcrypt work factor: 12 by default (≈250 ms per hash). Tests lower it with BCRYPT_COST. [SEC-13] */
+export function bcryptCost() {
+  return Number(process.env.BCRYPT_COST) || 12;
+}
 export const CSRF_COOKIE = "bba_csrf";
 const SESSION_TTL_MS = 12 * 3_600_000;
 
@@ -24,7 +29,7 @@ export type AdminContext = { admin: Pick<AdminUser, "id" | "email" | "name" | "r
 
 // Compared against when the email does not exist, so response timing does not reveal valid emails.
 let dummyHash: string | undefined;
-const getDummyHash = () => (dummyHash ??= bcrypt.hashSync("not-a-real-password", 10));
+const getDummyHash = () => (dummyHash ??= bcrypt.hashSync("not-a-real-password", bcryptCost()));
 
 export async function loginAdmin(email: string, password: string, ip: string) {
   const normalized = email.trim().toLowerCase();
@@ -101,5 +106,5 @@ export async function requireAdminApi(req: Request, minRole: AdminRole = "STAFF"
 }
 
 export async function hashPassword(pw: string) {
-  return bcrypt.hash(pw, 10);
+  return bcrypt.hash(pw, bcryptCost());
 }

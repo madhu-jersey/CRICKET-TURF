@@ -1,6 +1,6 @@
 /**
  * Integration tests against a real Postgres (PGlite in memory) with the real schema, exclusion
- * constraint and seed data. Set TEST_DATABASE_URL to run the same suite on a server Postgres.
+ * constraint and seed data. (Always PGlite; to run against a server Postgres, swap createPgliteDb for a postgres-js client.)
  */
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { and, eq } from "drizzle-orm";
@@ -177,6 +177,8 @@ describe("payments", () => {
 describe("new customer offer", () => {
   const phone = "+919855555555";
   it("applies once per mobile number, and not to returning customers", async () => {
+    // This test needs 3 bookings from one number; the per-number limit has its own security test.
+    await db.update(schema.settings).set({ maxActiveBookingsPerPhone: 5 });
     const first = await hold({ phone, times: ["14:00"] });
     expect(first.discount).toBeGreaterThan(0);
     // A second hold while the first (discounted) one is still open does not get it again.

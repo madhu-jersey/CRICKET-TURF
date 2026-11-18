@@ -22,11 +22,36 @@ function sniff(buf: Uint8Array): string | null {
   return null;
 }
 
+/**
+ * Re-encodes an uploaded image to WebP: strips EXIF/GPS and any other metadata, rejects images
+ * over 40 MP (decompression bombs), and caps the long edge at 2400 px. Whatever bytes the uploader
+ * sent never reach storage — only a freshly encoded image does. [SEC-20]
+ */
+export async function sanitizeImage(input: Uint8Array): Promise<Uint8Array<ArrayBuffer>> {
+  const { default: sharp } = await import("sharp");
+  try {
+    const meta = await sharp(input, { limitInputPixels: 40_000_000 }).metadata();
+    if (!meta.width || !meta.height) throw new Error("no dimensions");
+    if (meta.width < 200 || meta.height < 200) throw new AppError("VALIDATION", "Image is too small (minimum 200 × 200 px).");
+    const out = await sharp(input, { limitInputPixels: 40_000_000 })
+      .rotate() // apply EXIF orientation before the metadata is dropped
+      .resize({ width: 2400, height: 2400, fit: "inside", withoutEnlargement: true })
+      .webp({ quality: 82 })
+      .toBuffer();
+    return new Uint8Array(out);
+  } catch (e) {
+    if (e instanceof AppError) throw e;
+    throw new AppError("VALIDATION", "This image couldn't be read or is too large. Try a smaller JPG or PNG.");
+  }
+}
+
 export async function storeImage(file: File): Promise<{ url: string; key: string }> {
   if (file.size > MAX_BYTES) throw new AppError("VALIDATION", "Image must be 4 MB or smaller.");
-  const data = new Uint8Array(await file.arrayBuffer());
-  const type = sniff(data);
-  if (!type || !TYPES[type]) throw new AppError("VALIDATION", "Upload a JPG, PNG, WebP or AVIF image.");
+  const raw = new Uint8Array(await file.arrayBuffer());
+  const sniffed = sniff(raw);
+  if (!sniffed || !TYPES[sniffed]) throw new AppError("VALIDATION", "Upload a JPG, PNG, WebP or AVIF image.");
+  const data = await sanitizeImage(raw);
+  const type = "image/webp";
 
   if (env.str("STORAGE_PROVIDER", "db") === "supabase") {
     const base = env.str("SUPABASE_URL").replace(/\/$/, "");

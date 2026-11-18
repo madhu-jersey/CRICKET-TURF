@@ -36,6 +36,16 @@ export function MyBookings() {
 
   useEffect(() => void load(), [load]);
 
+  const [optIn, setOptIn] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (stage === "list") void api<{ optIn: boolean }>("/api/my-bookings/whatsapp").then((r) => setOptIn(r.optIn)).catch(() => {});
+  }, [stage]);
+  const toggleWhatsapp = async () => {
+    if (optIn === null) return;
+    const r = await api<{ optIn: boolean }>("/api/my-bookings/whatsapp", { method: "POST", json: { optIn: !optIn } }).catch(() => null);
+    if (r) setOptIn(r.optIn);
+  };
+
   const signOut = async () => {
     await api("/api/session/phone", { method: "DELETE" }).catch(() => {});
     setRows([]);
@@ -81,6 +91,12 @@ export function MyBookings() {
           <h2 className="mb-3 font-display text-2xl font-bold uppercase">Past &amp; cancelled</h2>
           <List items={past} empty="Nothing here yet." />
         </section>
+        {optIn !== null && (
+          <div className="flex items-center justify-between gap-3 rounded-2xl border border-white/10 px-4 py-3 text-sm">
+            <span>WhatsApp booking messages: <strong>{optIn ? "On" : "Off"}</strong></span>
+            <button className="font-semibold text-flood underline" onClick={toggleWhatsapp}>{optIn ? "Stop messages" : "Turn on"}</button>
+          </div>
+        )}
         <div className="flex gap-3">
           <Link href="/book" className="font-semibold text-flood underline">Book another slot</Link>
           <button className="text-sm text-mist underline" onClick={signOut}>Use a different number</button>

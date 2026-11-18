@@ -6,7 +6,7 @@ import { adminApi } from "@/lib/admin/client";
 import { Button } from "@/components/ui/button";
 import { Alert, Input, Label, Select } from "@/components/ui/field";
 
-type S = Record<"advanceType" | "advanceValue" | "holdMinutes" | "cancellationCutoffHours" | "refundPercentBeforeCutoff" | "maxDaysAhead" | "newCustomerDiscountPercent" | "ownerAlertPhone" | "businessName" | "address" | "mapLink" | "phone", string>;
+type S = Record<"advanceType" | "advanceValue" | "holdMinutes" | "cancellationCutoffHours" | "refundPercentBeforeCutoff" | "maxDaysAhead" | "newCustomerDiscountPercent" | "maxActiveBookingsPerPhone" | "maxBookingsPerPhonePerDay" | "noShowBlockThreshold" | "otpDailyCap" | "ownerAlertPhone" | "businessName" | "address" | "mapLink" | "phone", string>;
 
 export function SettingsForm({ initial, providers }: { initial: S; providers: { payment: string; messaging: string; otp: string; demo: boolean } }) {
   const router = useRouter();
@@ -73,6 +73,26 @@ export function SettingsForm({ initial, providers }: { initial: S; providers: { 
           <Label htmlFor="s-ownerAlertPhone">Owner alert WhatsApp number (10 digits, blank to disable)</Label>
           <Input type="tel" inputMode="numeric" {...f("ownerAlertPhone")} className="h-10" />
         </div>
+      </fieldset>
+      <fieldset className="grid grid-cols-2 gap-3 rounded-2xl border border-zinc-200 bg-white p-4 sm:p-5">
+        <legend className="px-1 text-sm font-bold uppercase tracking-wider text-zinc-500">Spam protection</legend>
+        <div>
+          <Label htmlFor="s-maxActiveBookingsPerPhone">Max upcoming bookings per number</Label>
+          <Input type="number" min={1} max={20} {...f("maxActiveBookingsPerPhone")} className="h-10" />
+        </div>
+        <div>
+          <Label htmlFor="s-maxBookingsPerPhonePerDay">Max new bookings per number per day</Label>
+          <Input type="number" min={1} max={50} {...f("maxBookingsPerPhonePerDay")} className="h-10" />
+        </div>
+        <div>
+          <Label htmlFor="s-noShowBlockThreshold">Block a number after this many no-shows (0 = never)</Label>
+          <Input type="number" min={0} max={20} {...f("noShowBlockThreshold")} className="h-10" />
+        </div>
+        <div>
+          <Label htmlFor="s-otpDailyCap">Max OTP codes per day (all customers)</Label>
+          <Input type="number" min={10} max={100000} {...f("otpDailyCap")} className="h-10" />
+        </div>
+        <p className="col-span-2 text-xs text-zinc-500">If the daily OTP limit is reached, codes pause until tomorrow and you get a WhatsApp alert on the owner number.</p>
       </fieldset>
       <fieldset className="grid gap-3 rounded-2xl border border-zinc-200 bg-white p-4 sm:p-5">
         <legend className="px-1 text-sm font-bold uppercase tracking-wider text-zinc-500">Business info</legend>

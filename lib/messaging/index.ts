@@ -10,6 +10,7 @@ import { env } from "@/lib/env";
 import { getMessagingProvider } from "@/lib/providers/messaging";
 import { renderTemplate, type TemplateName } from "@/lib/messaging/templates";
 import { runInBackground } from "@/lib/background";
+import { maskForLog } from "@/lib/security";
 
 export const MAX_MESSAGE_ATTEMPTS = 3;
 
@@ -84,7 +85,7 @@ export async function dispatchMessage(id: string, realParams?: Record<string, st
         .update(schema.messageLogs)
         .set({ status: final ? "FAILED" : "QUEUED", attempts, error, provider: provider.name, updatedAt: new Date() })
         .where(eq(schema.messageLogs.id, id));
-      console.warn(`[messaging] ${row.template} → ${row.phone} failed (${error})`);
+      console.warn(`[messaging] ${row.template} → ${maskForLog(row.phone)} failed (${error})`);
       if (final) return;
       await sleep(env.messageRetryBaseMs * 2 ** (attempts - 1));
     }

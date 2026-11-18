@@ -10,16 +10,21 @@ const nextConfig: NextConfig = {
     formats: ["image/avif", "image/webp"],
   },
   poweredByHeader: false,
+  productionBrowserSourceMaps: false,
+  // Security headers on every response (the per-page CSP with a nonce is added in proxy.ts). [SEC-21]
   async headers() {
+    const common = [
+      { key: "X-Content-Type-Options", value: "nosniff" },
+      { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
+      { key: "X-Frame-Options", value: "DENY" },
+      { key: "Permissions-Policy", value: "camera=(), microphone=(), geolocation=(), usb=(), interest-cohort=(), payment=(self \"https://api.razorpay.com\")" },
+      { key: "Cross-Origin-Opener-Policy", value: "same-origin-allow-popups" },
+      ...(process.env.NODE_ENV === "production" ? [{ key: "Strict-Transport-Security", value: "max-age=63072000; includeSubDomains; preload" }] : []),
+    ];
     return [
-      {
-        source: "/(.*)",
-        headers: [
-          { key: "X-Content-Type-Options", value: "nosniff" },
-          { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
-          { key: "X-Frame-Options", value: "SAMEORIGIN" },
-        ],
-      },
+      { source: "/(.*)", headers: common },
+      { source: "/api/((?!files/).*)", headers: [{ key: "Cache-Control", value: "no-store" }] },
+      { source: "/admin/(.*)", headers: [{ key: "X-Robots-Tag", value: "noindex, nofollow" }, { key: "Cache-Control", value: "no-store" }] },
     ];
   },
 };

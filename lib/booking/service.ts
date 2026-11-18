@@ -25,11 +25,43 @@ import { audit } from "@/lib/audit";
 import { randomCode } from "@/lib/security";
 import { formatDate, formatTimeRange, formatTime } from "@/lib/time";
 import { env } from "@/lib/env";
-import type { Booking, BookingSource, Payment } from "@/db/schema";
+import type { Booking, BookingSource, Payment, SettingsRow } from "@/db/schema";
 
-export const MAX_ACTIVE_HOLDS_PER_PHONE = 3;
+/** 8 chars from a 31-symbol alphabet ≈ 8.5 × 10¹¹ codes, so codes can't be guessed. [SEC-11] */
+const newBookingCode = () => `${siteConfig.bookingCodePrefix}-${randomCode(8)}`;
 
-const newBookingCode = () => `${siteConfig.bookingCodePrefix}-${randomCode(6)}`;
+/** Shown to blocked numbers. Deliberately generic: it doesn't say why. [SEC-12] */
+export const BLOCKED_MESSAGE = `We can't take this booking online. Please call ${siteConfig.phoneDisplay} to book.`;
+
+/**
+ * Anti-squatting limits for online bookings, checked inside the hold transaction while the
+ * customer row is locked (so parallel requests from one number can't exceed them). [SEC-10]
+ * - blocked numbers (e.g. repeated no-shows) can't book online
+ * - at most `maxActiveBookingsPerPhone` upcoming bookings (confirmed or on hold)
+ * - at most `maxBookingsPerPhonePerDay` new bookings per 24 h, cancelled ones included,
+ *   which also stops endless book-and-cancel cycles
+ */
+async function enforceBookingLimits(tx: Tx, customer: { id: string; isBlocked: boolean }, settings: SettingsRow, now: Date) {
+  if (customer.isBlocked) throw new AppError("NOT_ALLOWED", BLOCKED_MESSAGE);
+  const mine = await tx
+    .select({ status: schema.bookings.status, endAt: schema.bookings.endAt, holdExpiresAt: schema.bookings.holdExpiresAt, createdAt: schema.bookings.createdAt })
+    .from(schema.bookings)
+    .where(eq(schema.bookings.customerId, customer.id));
+  const active = mine.filter(
+    (b) => (b.status === "CONFIRMED" && b.endAt > now) || (b.status === "PENDING_PAYMENT" && !!b.holdExpiresAt && b.holdExpiresAt > now),
+  ).length;
+  if (active >= settings.maxActiveBookingsPerPhone) {
+    throw new AppError(
+      "RATE_LIMITED",
+      `You already have ${active} upcoming booking${active === 1 ? "" : "s"}. You can book again after playing or cancelling one.`,
+    );
+  }
+  const dayAgo = new Date(now.getTime() - 24 * 3_600_000);
+  const today = mine.filter((b) => b.createdAt > dayAgo && b.status !== "EXPIRED").length;
+  if (today >= settings.maxBookingsPerPhonePerDay) {
+    throw new AppError("RATE_LIMITED", "You've made too many bookings today. Please try again tomorrow or call the venue.");
+  }
+}
 
 function isConstraint(err: unknown, code: string) {
   return pgErrorCode(err) === code;
@@ -159,13 +191,7 @@ export async function createOnlineHold(
   try {
     booking = await db.transaction(async (tx) => {
       const customer = await upsertCustomer(tx, input.phone, input.name, input.whatsappOptIn, now);
-      const [{ n }] = await tx
-        .select({ n: count() })
-        .from(schema.bookings)
-        .where(and(eq(schema.bookings.customerId, customer.id), eq(schema.bookings.status, "PENDING_PAYMENT"), gt(schema.bookings.holdExpiresAt, now)));
-      if (n >= MAX_ACTIVE_HOLDS_PER_PHONE) {
-        throw new AppError("RATE_LIMITED", "You have too many unpaid bookings. Complete or let them expire first.");
-      }
+      await enforceBookingLimits(tx, customer, settings, now);
       await expireStaleOverlapping(tx, input.courtId, startAt, endAt, now);
       // First-booking offer, decided inside the transaction while the customer row is locked,
       // so two parallel holds from the same new number can't both get it.
@@ -230,7 +256,8 @@ export async function holdResponseFor(code: string, phone: string | null, now = 
     total: b.totalAmount,
     advance: b.advanceAmount,
     balance: b.balanceAmount,
-    prefill: { name: d.customer.name, phone: d.customer.phone },
+    // Only the verified owner gets their phone back; anyone else holding the code sees no number. [SEC-05]
+    prefill: phone ? { name: d.customer.name, phone: d.customer.phone } : { name: d.customer.name.split(" ")[0], phone: "" },
   };
   if (b.status !== "PENDING_PAYMENT") return { ...base, order: null };
   if (!b.holdExpiresAt || b.holdExpiresAt.getTime() <= now.getTime()) throw new AppError("HOLD_EXPIRED", "Your slot hold expired. Please pick the slot again.");
@@ -370,6 +397,11 @@ export async function markPaymentFailed(orderId: string, raw: unknown, now = new
   return { updated: true };
 }
 
+/** Store only what we need from a webhook (no email/contact/VPA/card details). [SEC-17] */
+function minimalPayload(event: string, pay: { id?: string; order_id?: string; amount?: number } & Record<string, unknown>) {
+  return { event, payment: { id: pay.id, order_id: pay.order_id, amount: pay.amount, status: pay.status, method: pay.method } };
+}
+
 /** Verifies and processes a Razorpay (or mock) webhook. Idempotent per event id. */
 export async function handlePaymentWebhook(rawBody: string, signature: string | null, eventIdHeader: string | null) {
   const provider = getPaymentProvider();
@@ -392,9 +424,9 @@ export async function handlePaymentWebhook(rawBody: string, signature: string | 
 
   let result: unknown = null;
   if ((event === "payment.captured" || event === "order.paid") && pay?.id && pay.order_id) {
-    result = await confirmPayment({ orderId: pay.order_id, paymentId: pay.id, amountPaise: pay.amount, raw: body, via: "webhook" });
+    result = await confirmPayment({ orderId: pay.order_id, paymentId: pay.id, amountPaise: pay.amount, raw: minimalPayload(event, pay), via: "webhook" });
   } else if (event === "payment.failed" && pay?.order_id) {
-    result = await markPaymentFailed(pay.order_id, body);
+    result = await markPaymentFailed(pay.order_id, minimalPayload(event, pay));
   }
   await db.insert(schema.webhookEvents).values({ id: eventId, type: event }).onConflictDoNothing();
   return { duplicate: false, event, result };
@@ -606,6 +638,24 @@ export async function setBookingOutcome(bookingId: string, outcome: "COMPLETED" 
     if (b.startAt.getTime() > now.getTime()) throw new AppError("NOT_ALLOWED", "You can mark this after the slot starts.");
     await tx.update(schema.bookings).set({ status: outcome, updatedAt: now }).where(eq(schema.bookings.id, b.id));
     await audit(tx, { actor, action: `booking.${outcome.toLowerCase()}`, entity: "Booking", entityId: b.id, before: { status: b.status }, after: { status: outcome } });
+    if (outcome === "NO_SHOW") {
+      // Auto-block a number after N no-shows (Settings.noShowBlockThreshold, 0 = off). [SEC-12]
+      const settings = await getSettings(tx);
+      if (settings.noShowBlockThreshold > 0) {
+        const [{ n }] = await tx
+          .select({ n: count() })
+          .from(schema.bookings)
+          .where(and(eq(schema.bookings.customerId, b.customerId), eq(schema.bookings.status, "NO_SHOW")));
+        if (n >= settings.noShowBlockThreshold) {
+          const blocked = await tx
+            .update(schema.customers)
+            .set({ isBlocked: true, blockedAt: now, blockedReason: `${n} no-shows` })
+            .where(and(eq(schema.customers.id, b.customerId), eq(schema.customers.isBlocked, false)))
+            .returning({ id: schema.customers.id });
+          if (blocked.length) await audit(tx, { actor: "system", action: "customer.auto_block", entity: "Customer", entityId: b.customerId, after: { noShows: n } });
+        }
+      }
+    }
   });
 }
 

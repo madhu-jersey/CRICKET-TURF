@@ -1,15 +1,10 @@
 import { adminRoute } from "@/lib/admin/route";
 import { searchBookings } from "@/lib/admin/reports";
 import { formatDate, formatTimeRange, istDateKey } from "@/lib/time";
+import { csvCell as esc } from "@/lib/csv";
 
-const esc = (v: unknown) => {
-  const s = String(v ?? "");
-  // Neutralise spreadsheet formula injection and quote everything.
-  const safe = /^[=+\-@\t\r]/.test(s) ? `'${s}` : s;
-  return `"${safe.replace(/"/g, '""')}"`;
-};
-
-export const GET = adminRoute("STAFF", async (req) => {
+/** Full customer export (names + phones): owner only. [SEC-14] */
+export const GET = adminRoute("OWNER", async (req) => {
   const u = new URL(req.url).searchParams;
   const { rows } = await searchBookings(
     { q: u.get("q") ?? undefined, from: u.get("from") ?? undefined, to: u.get("to") ?? undefined, sport: u.get("sport") ?? undefined, court: u.get("court") ?? undefined, status: u.get("status") ?? undefined, source: u.get("source") ?? undefined },

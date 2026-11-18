@@ -23,7 +23,7 @@ export default function Terms() {
         <li>Damage to nets, lights or equipment caused by misuse may be charged.</li>
       </ul>
       <h2>Venue rights</h2>
-      <p>We may refuse or end a session for unsafe or abusive behaviour. If we must close the venue (weather, maintenance, emergencies) we will refund or reschedule as described in the refund policy.</p>
+      <p>To keep slots fair, each mobile number can hold a limited number of upcoming bookings, and numbers with repeated no-shows may be blocked from booking online (you can still book by calling us). We may refuse or end a session for unsafe or abusive behaviour. If we must close the venue (weather, maintenance, emergencies) we will refund or reschedule as described in the refund policy.</p>
       <h2>Liability</h2>
       <p>To the extent permitted by law, the venue is not liable for injuries or losses arising from participation in sports, except where caused by our negligence.</p>
       <h2>Governing law</h2>

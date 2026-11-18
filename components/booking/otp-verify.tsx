@@ -35,11 +35,37 @@ export function OtpVerify({
   const started = useRef(false);
   const targetKey = JSON.stringify(target);
 
+  // Optional Cloudflare Turnstile "I'm human" check (only when NEXT_PUBLIC_TURNSTILE_SITE_KEY is set).
+  const siteKey = process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY;
+  const [captcha, setCaptcha] = useState<string | null>(null);
+  const captchaBox = useRef<HTMLDivElement>(null);
+  const widgetId = useRef<string | null>(null);
+  useEffect(() => {
+    if (!siteKey || !captchaBox.current) return;
+    const w = window as unknown as { turnstile?: { render: (el: HTMLElement, o: Record<string, unknown>) => string; reset: (id: string) => void } };
+    const render = () => {
+      if (!w.turnstile || !captchaBox.current || widgetId.current) return;
+      widgetId.current = w.turnstile.render(captchaBox.current, { sitekey: siteKey, callback: (t: string) => setCaptcha(t), "expired-callback": () => setCaptcha(null) });
+    };
+    if (w.turnstile) return render();
+    const s = document.createElement("script");
+    s.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+    s.async = true;
+    s.onload = render;
+    document.head.appendChild(s);
+  }, [siteKey]);
+  const resetCaptcha = () => {
+    const w = window as unknown as { turnstile?: { reset: (id: string) => void } };
+    if (widgetId.current) w.turnstile?.reset(widgetId.current);
+    setCaptcha(null);
+  };
+
   const send = useCallback(async () => {
+    if (siteKey && !captcha) return;
     setSending(true);
     setError(null);
     try {
-      const r = await api<SendRes>("/api/otp/send", { method: "POST", json: JSON.parse(targetKey) });
+      const r = await api<SendRes>("/api/otp/send", { method: "POST", json: { ...JSON.parse(targetKey), turnstileToken: captcha ?? undefined } });
       setSent(r);
       setCooldown(r.resendIn);
       setDigits(Array(6).fill(""));
@@ -48,15 +74,16 @@ export function OtpVerify({
       setError((e as Error).message);
     } finally {
       setSending(false);
+      if (siteKey) resetCaptcha();
     }
-  }, [targetKey]);
+  }, [targetKey, captcha, siteKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
-    if (autoSend && !started.current) {
+    if (autoSend && !started.current && (!siteKey || captcha)) {
       started.current = true;
       void send();
     }
-  }, [autoSend, send]);
+  }, [autoSend, send, siteKey, captcha]);
 
   useEffect(() => {
     if (cooldown <= 0) return;
@@ -121,6 +148,8 @@ export function OtpVerify({
         <p className={cn("text-sm", dark ? "text-mist" : "text-zinc-600")}>{sending ? "Sending your code…" : "We'll send a 6-digit code to your phone."}</p>
       )}
 
+      {siteKey && <div ref={captchaBox} className="mt-3 min-h-[65px]" />}
+
       {sent?.devCode && (
         <div role="status" className="mt-3 rounded-xl border-2 border-dashed border-flood-dim bg-flood/15 px-4 py-2.5 text-sm text-current" data-testid="dev-otp">
           Demo mode — your code is <strong className="font-mono text-base tracking-[0.2em]" data-testid="dev-otp-code">{sent.devCode}</strong>
@@ -161,7 +190,7 @@ export function OtpVerify({
       <div className="mt-4 flex items-center gap-3 text-sm">
         {verifying && <span className="font-semibold">Verifying…</span>}
         {!verifying && (
-          <Button type="button" variant={dark ? "outline" : "light"} size="sm" onClick={send} disabled={cooldown > 0} loading={sending}>
+          <Button type="button" variant={dark ? "outline" : "light"} size="sm" onClick={send} disabled={cooldown > 0 || (!!siteKey && !captcha)} loading={sending}>
             {sent ? (cooldown > 0 ? `Resend code in ${cooldown}s` : "Resend code") : "Send code"}
           </Button>
         )}

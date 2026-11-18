@@ -90,7 +90,7 @@ E2E covers: home → book → OTP → pay → confirmation; payment failure → 
 
 ### WhatsApp — Meta Cloud API
 1. In Meta Business Manager create a WhatsApp Business app, add a phone number, and generate a permanent system-user token.
-2. Create and get approved templates named exactly: `otp_code` (Authentication category, with copy-code button), `booking_confirmed`, `booking_reminder`, `booking_cancelled`, `payment_failed_hold_expiring`, `admin_new_booking` (Utility). Body variables `{{1}}…{{n}}` must follow the order in [`lib/messaging/templates.ts`](lib/messaging/templates.ts). Create a Telugu (`te`) version too if you set `MESSAGE_LANGUAGE=te`.
+2. Create and get approved templates named exactly: `otp_code` (Authentication category, with copy-code button), `booking_confirmed`, `booking_reminder`, `booking_cancelled`, `payment_failed_hold_expiring`, `admin_new_booking`, `admin_alert` (Utility; one variable, used for security alerts such as the OTP daily cap). Body variables `{{1}}…{{n}}` must follow the order in [`lib/messaging/templates.ts`](lib/messaging/templates.ts). Create a Telugu (`te`) version too if you set `MESSAGE_LANGUAGE=te`.
 3. Set `MESSAGING_PROVIDER=meta`, `META_WA_TOKEN`, `META_WA_PHONE_NUMBER_ID`.
 
 ### WhatsApp — BSP (Interakt / AiSensy / Gupshup)
@@ -107,6 +107,10 @@ Set `MESSAGING_PROVIDER=bsp`, `BSP_API_URL`, `BSP_API_KEY` (and `BSP_AUTH_HEADER
 2. Import the repo in Vercel and add the environment variables (at least `DATABASE_URL`, `APP_SECRET`, `CRON_SECRET`, `NEXT_PUBLIC_SITE_URL`).
 3. [`vercel.json`](vercel.json) schedules `/api/cron/expire-holds` every minute and `/api/cron/send-reminders` every 15 minutes. Per-minute crons need a Vercel Pro plan; on Hobby, change the schedule to daily (or use Supabase `pg_cron` / an external pinger). Availability stays correct either way, because expired holds are always treated as free.
 4. Set `STORAGE_PROVIDER=supabase` + Supabase keys if you'd rather keep gallery uploads out of the database (create a **public** bucket named in `SUPABASE_BUCKET`).
+
+## Security
+
+See [SECURITY_REPORT.md](SECURITY_REPORT.md) for the full review: findings, fixes, tests and what to set before launch. Security regression tests live in `tests/security/` (`npm run test:security`). On a live server (`NODE_ENV=production`, `DEMO_MODE=false`) the app **refuses to start** if demo admins, mock providers or missing secrets are still in place.
 
 ## Go-live checklist
 

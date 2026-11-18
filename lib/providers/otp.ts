@@ -9,6 +9,7 @@ import { env, mockOtpAllowed } from "@/lib/env";
 import { getDb } from "@/db/client";
 import { enqueueMessage, dispatchMessage } from "@/lib/messaging";
 import { AppError } from "@/lib/errors";
+import { maskForLog } from "@/lib/security";
 
 export interface OtpProvider {
   readonly name: "mock" | "whatsapp" | "sms";
@@ -20,7 +21,8 @@ export class MockOtp implements OtpProvider {
   readonly name = "mock" as const;
   async send(phone: string, code: string) {
     if (!mockOtpAllowed()) throw new AppError("PROVIDER_ERROR", "OTP provider is not configured");
-    console.info(`[otp:mock] ${phone} → ${code}`);
+    // Mock only (dev / DEMO_MODE): the code is shown on screen anyway. Real providers never log codes.
+    console.info(`[otp:mock] ${maskForLog(phone)} → ${code}`);
     const db = await getDb();
     // Logged in the outbox so the demo shows what would be sent (code visible: it's a mock).
     const id = await enqueueMessage(db, { phone, template: "otp_code", params: { code }, optedIn: true });
