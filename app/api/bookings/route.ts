@@ -1,7 +1,9 @@
 import { NextResponse } from "next/server";
 import { AppError, handle, readJson } from "@/lib/errors";
 import { createBookingSchema } from "@/lib/validation";
-import { clientIp, hitRateLimit } from "@/lib/ratelimit";
+import { clientIp } from "@/lib/ratelimit";
+import { enforceIpLimit } from "@/lib/ip-limits";
+import { getSettings } from "@/lib/booking/data";
 import { alertOwner } from "@/lib/alerts";
 import { getVerifiedPhone } from "@/lib/auth/phone";
 import { createOnlineHold } from "@/lib/booking/service";
@@ -12,9 +14,11 @@ export const POST = handle(async (req: Request) => {
   const phone = await getVerifiedPhone();
   if (!phone) throw new AppError("PHONE_NOT_VERIFIED", "Please verify your phone number again.");
   const ip = clientIp(req);
-  if (!(await hitRateLimit(`booking-ip:${ip}`, 30, 60 * 60_000))) {
+  try {
+    await enforceIpLimit("booking", ip, (await getSettings()).bookingPerIpHour);
+  } catch (e) {
     void alertOwner("booking_flood", "Many booking attempts from one network in the last hour — they are being blocked. Check Bookings for spam.");
-    throw new AppError("RATE_LIMITED", "Too many booking attempts. Please try again later.");
+    throw e;
   }
   const input = createBookingSchema.parse(await readJson(req));
   const hold = await createOnlineHold({ ...input, phone, deviceId: await getDeviceId() });

@@ -8,7 +8,22 @@ import { OtpVerify } from "@/components/booking/otp-verify";
 import { api, ApiError, inr } from "@/lib/utils";
 
 /** Cancel button for the booking page. Asks for OTP first if this browser hasn't verified the owner's phone. */
-export function CancelBooking({ bookingCode, refund, paid, cutoffHours, verified }: { bookingCode: string; refund: number; paid: number; cutoffHours: number; verified: boolean }) {
+export function CancelBooking({
+  bookingCode,
+  refund,
+  paid,
+  policy,
+  canCancel,
+  verified,
+}: {
+  bookingCode: string;
+  refund: number;
+  paid: number;
+  /** Policy sentence generated from Settings (lib/policy). */
+  policy: string;
+  canCancel: boolean;
+  verified: boolean;
+}) {
   const router = useRouter();
   const [stage, setStage] = useState<"idle" | "otp" | "confirm" | "done">("idle");
   const [busy, setBusy] = useState(false);
@@ -42,14 +57,17 @@ export function CancelBooking({ bookingCode, refund, paid, cutoffHours, verified
   return (
     <div className="rounded-2xl border border-zinc-200 p-5">
       <h2 className="font-display text-xl font-bold uppercase">Need to cancel?</h2>
-      <p className="mt-1 text-sm text-zinc-600">
-        {refund > 0
-          ? `Cancel now and get ${inr(refund)} back.`
-          : paid > 0
-            ? `Your slot starts within ${cutoffHours} hours, so the advance of ${inr(paid)} is non-refundable.`
-            : "This booking has no online payment to refund."}
+      <p className="mt-1 text-sm text-zinc-600" data-testid="cancel-policy">{policy}</p>
+      <p className="mt-1 text-sm font-semibold text-zinc-800">
+        {!canCancel
+          ? "Online cancelling has closed for this booking. Please call the venue."
+          : refund > 0
+            ? `Cancel now and get ${inr(refund)} back.`
+            : paid > 0
+              ? `If you cancel now, the advance of ${inr(paid)} is not refunded.`
+              : "This booking has no online payment to refund."}
       </p>
-      {stage === "idle" && (
+      {stage === "idle" && canCancel && (
         <Button variant="light" className="mt-4" onClick={() => setStage(verified ? "confirm" : "otp")}>
           Cancel booking
         </Button>

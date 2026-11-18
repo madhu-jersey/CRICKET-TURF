@@ -22,13 +22,22 @@ function adminCtx(email: string) {
       email,
       (async () => {
         const ctx = await pwRequest.newContext({ baseURL: BASE });
-        const r = await ctx.post("/api/admin/login", { data: { email, password: "Demo@1234" } });
-        expect(r.status()).toBe(200);
+        await loginWith2fa(ctx, email, "Demo@1234");
         return ctx;
       })(),
     );
   }
   return sessions.get(email)!;
+}
+/** Password step + (when required) the 2FA code step. Returns the login response JSON. */
+async function loginWith2fa(ctx: APIRequestContext, email: string, password: string, trustDevice = false) {
+  const r = await ctx.post("/api/admin/login", { data: { email, password, trustDevice } });
+  expect(r.status()).toBe(200);
+  const j = await r.json();
+  if (!j.twoFactor) return j;
+  const v = await ctx.post("/api/admin/login/verify", { data: { challengeId: j.challengeId, code: j.devCode } });
+  expect(v.status()).toBe(200);
+  return { ...j, verified: await v.json() };
 }
 let phoneSeq = 0;
 /** Verifies a phone via the mock OTP (the demo returns the code) and returns a context holding the cookie. */
@@ -98,6 +107,9 @@ const ADMIN_ROUTES: { method: "get" | "post" | "put" | "patch" | "delete"; path:
   { method: "post", path: "/api/admin/messages/x/retry", owner: true },
   { method: "put", path: "/api/admin/pricing", owner: true, data: {} },
   { method: "put", path: "/api/admin/settings", owner: true, data: {} },
+  { method: "post", path: "/api/admin/users", owner: true, data: {} },
+  { method: "patch", path: "/api/admin/users", owner: true, data: {} },
+  { method: "post", path: "/api/admin/otp-cap", owner: true, data: { amount: 10 } },
 ];
 
 test("SEC-14 every admin route: 401 without a session, 403 for STAFF on owner routes, 403 without CSRF", async () => {
@@ -216,3 +228,78 @@ test("SEC-19 oversized request bodies are rejected", async ({ request }) => {
 });
 
 void courts;
+
+test("SEC-39 2FA: no session without the code; trusted device skips it; a password change revokes trust", async () => {
+  // A fresh staff account so the shared demo logins aren't affected.
+  const owner = await adminCtx("owner@demo.com");
+  const email = `twofa.${Date.now()}@example.com`;
+  const created = await owner.post("/api/admin/users", {
+    data: { email, name: "Two Factor", phone: "9811100055", tempPassword: "Temp-Pass-12345" },
+    headers: { "x-csrf-token": await csrfOf(owner) },
+  });
+  expect(created.status()).toBe(201);
+
+  const ctx = await pwRequest.newContext({ baseURL: BASE });
+  const step1 = await (await ctx.post("/api/admin/login", { data: { email, password: "Temp-Pass-12345", trustDevice: true } })).json();
+  expect(step1.twoFactor).toBe(true);
+  expect((await ctx.get("/api/admin/availability?courtId=x&date=2026-01-01")).status()).toBe(401); // no session yet
+  expect((await ctx.post("/api/admin/login/verify", { data: { challengeId: step1.challengeId, code: step1.devCode === "000000" ? "111111" : "000000" } })).status()).toBe(400);
+  const ok = await ctx.post("/api/admin/login/verify", { data: { challengeId: step1.challengeId, code: step1.devCode } });
+  expect(ok.status()).toBe(200);
+  expect((await ok.json()).mustChangePassword).toBe(true);
+  // Forced change: other admin APIs refuse until the password is changed.
+  expect((await ctx.get("/api/admin/availability?courtId=x&date=2026-01-01")).status()).toBe(403);
+  const csrf = await csrfOf(ctx);
+  expect((await ctx.put("/api/admin/password", { data: { currentPassword: "wrong-password", newPassword: "Night-Match-2026!" }, headers: { "x-csrf-token": csrf } })).status()).toBe(400);
+
+  // Trusted device: logging in again from this context skips the code.
+  const again = await (await ctx.post("/api/admin/login", { data: { email, password: "Temp-Pass-12345" } })).json();
+  expect(again.twoFactor).toBeUndefined();
+
+  // Changing the password revokes device trust → the next login needs a code again.
+  const csrf2 = await csrfOf(ctx);
+  expect((await ctx.put("/api/admin/password", { data: { currentPassword: "Temp-Pass-12345", newPassword: "Night-Match-2026!" }, headers: { "x-csrf-token": csrf2 } })).status()).toBe(200);
+  const after = await (await ctx.post("/api/admin/login", { data: { email, password: "Night-Match-2026!" } })).json();
+  expect(after.twoFactor).toBe(true);
+  await ctx.dispose();
+});
+
+test("SEC-38 forgot password gives the same answer for real and unknown accounts", async ({ request }) => {
+  const a = await (await request.post(`${BASE}/api/admin/password`, { data: { email: "nobody-here@example.com" } })).json();
+  const b = await (await request.post(`${BASE}/api/admin/password`, { data: { email: "staff@demo.com" } })).json();
+  expect(a).toEqual(b);
+  expect(a.message).toMatch(/If this account exists/);
+});
+
+test("SEC-40 changing the policy settings changes every page that shows it", async () => {
+  const owner = await adminCtx("owner@demo.com");
+  const csrf = await csrfOf(owner);
+  const base = {
+    advanceType: "FIXED", advanceValue: "300", holdMinutes: "10", maxDaysAhead: "14", newCustomerDiscountPercent: "10",
+    cancelCutoffHours: "0", refundCutoffHours: "2", refundPercentBeforeCutoff: "100", refundPercentAfterCutoff: "0",
+    maxActiveBookingsPerPhone: "2", maxBookingsPerPhonePerDay: "4", noShowBlockThreshold: "3",
+    otpDailyCapNew: "200", otpDailyCapReturning: "300", otpSendPerIpHour: "30", otpVerifyPerIpHour: "60", bookingPerIpHour: "60", cancelPerIpHour: "30",
+    ownerAlertPhone: "9000000000", businessName: "Boundary Box Arena", address: "Near Bypass Road, Bhimavaram, Andhra Pradesh 534201",
+    mapLink: "https://maps.google.com/?q=16.5449,81.5212", phone: "9000000000",
+  };
+  const put = (data: object) => owner.put("/api/admin/settings", { data, headers: { "x-csrf-token": csrf } });
+  expect((await put({ ...base, refundCutoffHours: "5", refundPercentAfterCutoff: "25" })).status()).toBe(200);
+  try {
+    const policy = await (await owner.get("/refund-policy")).text();
+    expect(policy).toContain("5 hours or more");
+    expect(policy).toContain("25% of the advance back");
+    const book = await (await owner.get("/book?sport=cricket")).text();
+    expect(book).toContain("Cancel 5 hours or more before your slot");
+    const home = await (await owner.get("/")).text();
+    expect(home).toContain("Cancel 5 hours or more before your slot");
+    // Booking status page (a confirmed future booking).
+    const courtId = await cricketCourtId(owner);
+    const date = istDate(12);
+    const slot = await freeSlot(owner, courtId, date);
+    const w = await (await owner.post("/api/admin/walk-in", { data: { courtId, date, times: [slot.time], name: "Policy Check", phone: "9123400077", source: "PHONE", amountReceived: 0, paymentMode: "CASH" }, headers: { "x-csrf-token": csrf } })).json();
+    const status = await (await owner.get(`/booking/${w.bookingCode}`)).text();
+    expect(status).toContain("Cancel 5 hours or more before your slot");
+  } finally {
+    expect((await put(base)).status()).toBe(200);
+  }
+});

@@ -132,7 +132,7 @@ export default async function BookingPage({ params, searchParams }: { params: Pr
               </div>
             )}
             {confirmed && refundPreview && (
-              <CancelBooking bookingCode={code} refund={refundPreview.refund} paid={refundPreview.paid} cutoffHours={refundPreview.cutoffHours} verified={verifiedPhone === d.customer.phone} />
+              <CancelBooking bookingCode={code} refund={refundPreview.refund} paid={refundPreview.paid} policy={refundPreview.policy} canCancel={refundPreview.canCancel} verified={verifiedPhone === d.customer.phone} />
             )}
             {!confirmed && !hold && <ButtonLink href="/book" variant="dark">Book another slot</ButtonLink>}
           </div>

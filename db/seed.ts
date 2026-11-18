@@ -91,7 +91,7 @@ export async function seedDatabase(db: DB, now = new Date()) {
       advanceType: "FIXED",
       advanceValue: 300,
       holdMinutes: 10,
-      cancellationCutoffHours: 2,
+      refundCutoffHours: 2,
       refundPercentBeforeCutoff: 100,
       maxDaysAhead: 14,
       ownerAlertPhone: siteConfig.phoneE164,
@@ -106,8 +106,8 @@ export async function seedDatabase(db: DB, now = new Date()) {
   await db
     .insert(schema.adminUsers)
     .values([
-      { email: "owner@demo.com", name: "Demo Owner", passwordHash: hash, role: "OWNER" },
-      { email: "staff@demo.com", name: "Demo Staff", passwordHash: hash, role: "STAFF" },
+      { email: "owner@demo.com", name: "Demo Owner", passwordHash: hash, role: "OWNER", phone: siteConfig.phoneE164 },
+      { email: "staff@demo.com", name: "Demo Staff", passwordHash: hash, role: "STAFF", phone: "+919000000001" },
     ])
     .onConflictDoNothing();
 

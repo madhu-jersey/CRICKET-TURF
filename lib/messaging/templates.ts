@@ -23,12 +23,12 @@ export const TEMPLATES: Record<TemplateName, Def> = {
     },
   },
   booking_confirmed: {
-    params: ["name", "sport", "court", "date", "time", "code", "advance", "balance", "map"],
+    params: ["name", "sport", "court", "date", "time", "code", "advance", "balance", "map", "policy"],
     render: {
       en: (p) =>
-        `Hi ${p.name}, your ${p.sport} booking is confirmed! ✅\nCourt: ${p.court}\nDate: ${p.date}\nTime: ${p.time}\nBooking code: ${p.code}\nAdvance paid: ${p.advance}\nBalance at venue: ${p.balance}\nDirections: ${p.map}`,
+        `Hi ${p.name}, your ${p.sport} booking is confirmed! ✅\nCourt: ${p.court}\nDate: ${p.date}\nTime: ${p.time}\nBooking code: ${p.code}\nAdvance paid: ${p.advance}\nBalance at venue: ${p.balance}\nDirections: ${p.map}\nCancellation: ${p.policy}`,
       te: (p) =>
-        `నమస్తే ${p.name}, మీ ${p.sport} బుకింగ్ నిర్ధారించబడింది! ✅\nకోర్ట్: ${p.court}\nతేదీ: ${p.date}\nసమయం: ${p.time}\nబుకింగ్ కోడ్: ${p.code}\nఅడ్వాన్స్ చెల్లించారు: ${p.advance}\nవేదిక వద్ద బాకీ: ${p.balance}\nదారి: ${p.map}`,
+        `నమస్తే ${p.name}, మీ ${p.sport} బుకింగ్ నిర్ధారించబడింది! ✅\nకోర్ట్: ${p.court}\nతేదీ: ${p.date}\nసమయం: ${p.time}\nబుకింగ్ కోడ్: ${p.code}\nఅడ్వాన్స్ చెల్లించారు: ${p.advance}\nవేదిక వద్ద బాకీ: ${p.balance}\nదారి: ${p.map}\nరద్దు: ${p.policy}`,
     },
   },
   booking_reminder: {
@@ -80,7 +80,7 @@ export function renderTemplateUnsafe(name: TemplateName, params: Record<string, 
 export function cleanParam(value: string, key?: string): string {
   let v = String(value ?? "").replace(/[\r\n\t]+/g, " ").replace(/ {2,}/g, " ").trim();
   if (key === "name") v = v.replace(/https?:\/\//gi, "").replace(/\bwww\./gi, "").replace(/[<>{}]/g, "");
-  return v.slice(0, key === "text" ? 200 : 120);
+  return v.slice(0, key === "text" || key === "policy" ? 200 : 120);
 }
 
 export function cleanParams(params: Record<string, string>): Record<string, string> {

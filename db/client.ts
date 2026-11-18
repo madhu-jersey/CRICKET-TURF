@@ -82,5 +82,25 @@ export function pgErrorCode(err: unknown): string | undefined {
 
 export const PG_EXCLUSION_VIOLATION = "23P01";
 export const PG_UNIQUE_VIOLATION = "23505";
+export const PG_DEADLOCK = "40P01";
+export const PG_SERIALIZATION_FAILURE = "40001";
+
+/**
+ * Runs a transaction, retrying when Postgres aborts it as a deadlock victim or serialization
+ * failure. Concurrent inserts into the same exclusion-constraint range can deadlock (each waits
+ * for the other's uncommitted row); Postgres kills one, and the retry then sees the committed
+ * winner and fails cleanly with 23P01 ("slot taken"). Only found under real parallel Postgres. [SEC-33]
+ */
+export async function transactionWithRetry<T>(db: DB, fn: (tx: Tx) => Promise<T>, attempts = 4): Promise<T> {
+  for (let i = 1; ; i++) {
+    try {
+      return await db.transaction(fn);
+    } catch (e) {
+      const code = pgErrorCode(e);
+      if (i >= attempts || (code !== PG_DEADLOCK && code !== PG_SERIALIZATION_FAILURE)) throw e;
+      await new Promise((r) => setTimeout(r, 5 + Math.random() * 20 * i));
+    }
+  }
+}
 
 export { schema };

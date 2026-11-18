@@ -2,13 +2,14 @@ import { NextResponse } from "next/server";
 import { AppError, handle } from "@/lib/errors";
 import { bookingCodeSchema } from "@/lib/validation";
 import { getVerifiedPhone } from "@/lib/auth/phone";
-import { getBookingByCode } from "@/lib/booking/data";
 import { cancelBooking } from "@/lib/booking/service";
 import { clientIp, enforceRateLimit } from "@/lib/ratelimit";
+import { enforceIpLimit } from "@/lib/ip-limits";
+import { getBookingByCode, getSettings } from "@/lib/booking/data";
 
 /** Customer cancellation. Requires the verified-phone cookie of the booking's owner. */
 export const POST = handle(async (req: Request, ctx: { params: Promise<{ code: string }> }) => {
-  await enforceRateLimit(`cancel-ip:${clientIp(req)}`, 20, 60 * 60_000);
+  await enforceIpLimit("cancel", clientIp(req), (await getSettings()).cancelPerIpHour);
   const code = bookingCodeSchema.parse((await ctx.params).code);
   const d = await getBookingByCode(code);
   if (!d) throw new AppError("NOT_FOUND", "Booking not found.");

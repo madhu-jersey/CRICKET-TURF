@@ -2,7 +2,7 @@
 
 **Scope:** full codebase review + testing of the Next.js turf booking site (box cricket + pickleball): public booking with phone OTP, ₹ advance payment (Razorpay / mock), WhatsApp messaging, owner/staff dashboard.
 **Environment:** local only — embedded Postgres (PGlite, real Postgres 17 with the real migrations), mock OTP / WhatsApp / payment providers, isolated production build on `localhost:3100`. No production systems, real payment accounts or real phone numbers were used.
-**Date:** 18 Nov 2026 · **Version tested:** `main` + the fixes in this report.
+**Date:** 18 Nov 2026 · **Version tested:** `main` + the fixes in this report. **Follow-up round (SEC-33 → SEC-40):** same day, branch `security-review`; real Postgres 17 (embedded, 25 connections) added for race testing.
 
 > Note: this site **keeps online advance payment** (owner decision), so the review covers both the "no payment" checklist (booking abuse, OTP flooding, access control) and the payment checks (fake/forged/replayed payments, refunds).
 
@@ -13,14 +13,16 @@
 | Severity | Found | Fixed | Accepted risk | Needs owner action |
 |---|---|---|---|---|
 | Critical | 1 | 1 | – | – |
-| High | 5 | 5 | – | – |
-| Medium | 9 | 9 | – | 1 (turn on Turnstile) |
-| Low | 8 | 6 | 2 | – |
+| High | 7 | 7 | – | – |
+| Medium | 13 | 13 | – | – |
+| Low | 10 | 9 | 1 | – |
 | Info | – | – | 3 | 1 (Supabase RLS, if used) |
+
+Counts include the follow-up round (SEC-33 → SEC-40). Turnstile is no longer "needs owner action": a live server now refuses to start without it.
 
 **Overall risk after fixes: Low.** Every Critical, High and Medium issue is fixed and covered by an automated test. The code is **safe to go live once the go-live checklist (§5) is done**. The new startup check refuses to run a live (`DEMO_MODE=false`) server until the critical items are set.
 
-**Tests:** 91 unit + integration tests (Vitest, including 27 in `tests/security/abuse.test.ts`), 19 browser/HTTP tests (Playwright, including 8 in `tests/security/http.spec.ts`, desktop + mobile). All pass.
+**Tests (after the follow-up round):** 110 Vitest tests on PGlite (+8 race tests skipped there), **118/118 on real Postgres 17** (`npm run test:realdb`), **8/8 race tests** with 25 truly parallel connections (`npm run test:concurrency`), 22 Playwright browser/HTTP tests (desktop + mobile; 12 desktop-only tests skipped on mobile). All pass. `npm audit`: 0 vulnerabilities (production and dev).
 
 The most important findings were:
 - **SEC-01 (Critical):** on a live site where `PAYMENT_PROVIDER` wasn't set, the demo "Simulate success" checkout still worked, so **anyone could book for free**.
@@ -192,8 +194,44 @@ Razorpay Orders/Refunds API · WhatsApp Cloud API or BSP · MSG91 SMS · Cloudfl
 - `lib/csv.ts`: cells starting with `= + - @ tab CR`, **even after spaces**, are prefixed with `'`; every cell is quoted.
 - **Test:** `abuse.test.ts › CSV cells can't run as spreadsheet formulas`, `http.spec.ts › SEC-22` (XSS payloads in name/notes → no script runs in admin views; CSV escaped)
 
-### SEC-28 — Dev dependency advisory (picomatch ReDoS via vitest) · **Low** · Accepted risk
-- `npm audit`: 5 high, all `picomatch ≤ 4.0.7` inside the **test runner** (vitest → vite/tinyglobby). No patched picomatch exists yet; the only "fix" is downgrading vitest to v3. It never ships to the website and only processes our own file globs. Re-check with `npm audit` monthly.
+### Follow-up round (SEC-33 → SEC-40)
+
+### SEC-33 — Real-parallel bookings deadlocked and surfaced raw database errors · **High** · Fixed
+- **Proof:** the first run of 50 parallel bookings on a real multi-connection Postgres (PGlite had hidden this, it runs one query at a time) took up to 60 s and some requests failed with raw `40P01 deadlock detected` errors instead of "slot taken". Cause: two transactions each flipping stale holds and inserting on the same court/day could lock rows in opposite orders.
+- **Fix:** every booking write for a court/day first takes `pg_advisory_xact_lock(hashtext(court|day))` (holds, walk-ins, late payment confirmation), and the transactions are wrapped in `transactionWithRetry` (retries `40P01` / `40001` up to 4 times). The exclusion constraint is still the final guard.
+- **Test:** `tests/concurrency/races.test.ts` — 50 parallel → exactly 1 OK + 49 "slot taken", under 15 s, with a check that the requests really overlapped. Test DB helper refuses non-local hosts (`followup.test.ts › SEC-33`).
+
+### SEC-34 — One shared OTP daily cap let an attacker lock out returning customers; Turnstile was optional and unchecked · **Medium** · Fixed
+- **Proof:** with a single cap, burning it with fresh numbers stopped every customer from logging in for the rest of the day. Turnstile responses were accepted without checking the hostname or action.
+- **Fix:** two pools — **new numbers (200/day)** and **returning numbers (300/day**, confirmed or completed booking in the last 90 days). Owner gets one WhatsApp alert at 80% and one at 100% per pool per day; Overview shows today's counts; owner-only **Raise today's cap** (audited) adds to both pools for today. Turnstile siteverify must match `TURNSTILE_HOSTNAMES` and action `otp_send`, fails closed, and a live server refuses to start without the keys.
+- **Tests:** `followup.test.ts › SEC-34` (pool exhaustion doesn't block a returning customer, boost is today-only, hostname/action, startup), `abuse.test.ts` (80/100 alerts once each).
+
+### SEC-35 — Every booking needed a new paid OTP, even from a known device · **Low** · Fixed (cost + abuse)
+- **Fix:** after a successful OTP, a 90-day HMAC-signed device cookie bound to that phone and the customer's `trustEpoch`. Same phone on the same device skips the code. Revoked when the customer is blocked (manually or by the no-show rule) or when the owner presses **Sign out trusted devices**.
+- **Test:** `followup.test.ts › SEC-35` (wrong phone rejected, revoked by block).
+
+### SEC-36 — Per-network limits were hardcoded and showed a bare error · **Medium** · Fixed
+- **Fix:** Settings → Network limits: OTP send 30/h, OTP verify 60/h, booking 60/h, cancel 30/h per IP. The customer sees "Too many requests from your network… call us on <venue phone>". The server logs a masked IP (`203.0.113.x`) and writes one `security.ip_limit` audit entry per IP per hour.
+- **Tests:** `followup.test.ts › SEC-36` (limits come from Settings; per-number limits still apply when the IP limit is high).
+
+### SEC-37 — Availability limiter was per-instance, and every poll recomputed the grid · **Medium** · Fixed
+- **Fix:** the limiter now uses a shared store (Postgres `Counter` table with an atomic UPSERT, or Upstash if configured), so limits hold across serverless instances. Availability is cached for 12 s and invalidated (shared `CacheVersion` bump) on hold, payment, cancel, walk-in, block and hold expiry.
+- **Tests:** `followup.test.ts › SEC-37` (limit holds across two limiter clients; cache reused then invalidated), 20 parallel limiter hits → exactly 5 (`races.test.ts`).
+
+### SEC-38 — No admin password change/reset; owner couldn't manage staff · **Medium** · Fixed
+- **Fix:** `/admin/account` (change password: 10+ chars, not common, not the email; signs out other sessions and revokes trusted devices). `/admin/forgot`: same answer for any email; 6-digit code to the registered phone, stored hashed, 10 min, single use, 5 tries, rate limited. `/admin/team` (owner only): create staff with a temporary password (forced change at first login), reset, disable/enable, set phone. `AdminUser.phone` added by migration 0006.
+- **Tests:** `followup.test.ts › SEC-38`, `http.spec.ts › SEC-38` (identical forgot-password answers), `http.spec.ts › SEC-14` (staff get 403 on the new owner routes).
+
+### SEC-39 — Dashboard login was password-only · **High** · Fixed
+- **Fix:** after the password, a 6-digit code to the admin's phone (WhatsApp, SMS fallback); "Trust this device" for 30 days, revoked by any password change or reset. Codes are bound to one admin and purpose, single use, 5 tries, and don't count against customer OTP caps. On by default for a live site; `ADMIN_2FA_REQUIRED=false` turns it off with a startup warning. The browser test server now runs with 2FA on.
+- **Tests:** `followup.test.ts › SEC-39`, `http.spec.ts › SEC-39` (no session before the code, wrong code rejected, trusted device skips it, password change revokes trust), `admin.spec.ts` (real login in the browser).
+
+### SEC-40 — Cancellation/refund rules were written in several places and could disagree · **Low** · Fixed
+- **Fix:** one source — Settings (`cancelCutoffHours`, `refundCutoffHours`, `refundPercentBeforeCutoff`, `refundPercentAfterCutoff`) → `lib/policy.ts` → `/refund-policy`, FAQ, booking form, booking status/cancel page, `booking_confirmed` and `booking_cancelled` messages, and the server-side refund calculation.
+- **Tests:** `followup.test.ts › SEC-40` (wording from Settings; a grep test fails if cutoff hours or refund percentages are hardcoded), `http.spec.ts › SEC-40` (change Settings → every page shows the new rule, then restored).
+
+### SEC-28 — Dev dependency advisory (picomatch ReDoS via vitest) · **Low** · Fixed (resolved upstream)
+- Earlier: 5 high advisories in `picomatch` inside the test runner. Re-checked 18 Nov 2026: `npm audit` and `npm audit --omit=dev` both report **0 vulnerabilities**. CI now fails on any high advisory in production dependencies.
 
 ### SEC-29 — Attacker can temporarily lock an admin out by failing logins · **Low** · Accepted risk
 - The per-account login limit (5 per 15 min) that stops password guessing can also be triggered by someone else. Accepted: it clears after 15 minutes, and the owner can still use another admin account.
@@ -244,26 +282,48 @@ Razorpay Orders/Refunds API · WhatsApp Cloud API or BSP · MSG91 SMS · Cloudfl
 - [ ] **Demo admins removed** (`owner@demo.com`, `staff@demo.com`) or their passwords changed. The server won't start otherwise.
 - [ ] Razorpay **live** keys + **webhook secret**; webhook URL `https://<domain>/api/webhooks/razorpay` with `payment.captured`, `payment.failed`, `order.paid`
 - [ ] `OTP_PROVIDER=whatsapp` (or `sms`) and WhatsApp templates **approved**, including the new `admin_alert` (Utility, one variable `{{1}}`)
-- [ ] **Turnstile keys** set (recommended)
-- [ ] Owner alert number set in Admin → Settings. Review the spam-protection limits: upcoming bookings per number, bookings per day, no-show block, OTP daily cap.
+- [ ] **Turnstile keys** set — **required** (the server refuses to start without them); `TURNSTILE_HOSTNAMES` = the live domain
+- [ ] **Owner phone** set (login codes and password resets go there — startup check)
+- [ ] **Admin 2FA on** (`ADMIN_2FA_REQUIRED` unset or `true`; the server warns if it is off)
+- [ ] **Split OTP caps** reviewed (new 200 / returning 300 per day) and **per-IP limits** reviewed (OTP send 30/h, verify 60/h, booking 60/h, cancel 30/h)
+- [ ] **Cancellation & refund settings** confirmed by the owner (they drive every page and message)
+- [ ] **CI green** on the release commit (`.github/workflows/security.yml`)
+- [ ] **Staging smoke test** done and signed off (`scripts/staging-smoke.md`)
+- [ ] Owner alert number set in Admin → Settings. Review the spam-protection limits: upcoming bookings per number, bookings per day, no-show block.
 - [ ] Supabase (if used): RLS on for every table; gallery bucket public-read only
 - [ ] Database backups on (e.g. Supabase PITR)
 - [ ] Monitoring: alerts on 5xx, on `payment.amount_mismatch` / `booking.refund_failed` audit entries, and on failed messages in the outbox
-- [ ] Re-run `npm run test`, `npm run test:e2e`, `npm audit` before each release
+- [ ] Re-run `npm run test`, `npm run test:concurrency`, `npm run test:e2e`, `npm audit` before each release (CI does this)
 
 ---
 
 ## 6. What could not be tested, and why
 
-- **gitleaks / trufflehog, semgrep, OWASP ZAP, k6:** none are installed on this machine (no Docker, no Python tools). Substitutes used:
-  - a regex secret scan of the working tree **and full git history**, and of the built client bundle;
-  - a manual review of every route, Server Component and SQL call against the semgrep Next.js/TypeScript rule themes;
-  - HTTP-level tests of headers, auth, CSRF and tampering in place of ZAP;
-  - concurrency covered by Vitest scripts (50 parallel bookings, 10 parallel OTP sends, 20 parallel limiter hits) in place of k6.
-
-  Run these tools in CI or on staging before launch.
+- **gitleaks, semgrep, OWASP ZAP:** now wired into CI (`.github/workflows/security.yml`, see §7) but **not run locally and not yet run in CI** — this branch hasn't been pushed, and installing them here would mean downloading tools the rules of engagement didn't cover. Local substitutes run instead: a regex secret scan of tracked + untracked files **and full git history** (0 hits), `npm audit` (0), and the HTTP security tests. **First CI run results must be recorded here before launch.**
+- **k6 load test:** not run. The race behaviour it would check is covered by `npm run test:concurrency` on real Postgres.
 - **Real Razorpay, WhatsApp Cloud API, MSG91, Turnstile and Supabase:** not used (no accounts; rules of engagement). Their adapters follow each provider's documented signature and auth scheme; the Razorpay HMAC formats are unit-tested against the documented algorithm.
 - **Vercel's header behaviour** (`x-real-ip` / `x-vercel-forwarded-for` overwritten by the platform) is documented by Vercel but could not be observed locally.
-- **Multi-instance Postgres race behaviour:** tests run on PGlite (a single connection, so it serialises queries). Correctness under true parallelism still holds because the exclusion constraint and advisory locks are enforced by Postgres itself. Still, run the concurrency tests once against the real staging database. The test helpers currently always use PGlite, so point the integration setup at the staging `DATABASE_URL` for that run.
+- **Race behaviour on real Postgres:** now tested (SEC-33) on an embedded Postgres 17 with 25 parallel connections, and in CI against a `postgres:17` container. **Not yet run against the Supabase staging database** — do it once with `TEST_DATABASE_URL` + `TEST_DB_ALLOWED_HOSTS` (see README).
 - **Pending-approval booking mode:** not implemented in this product (bookings are confirmed by payment), so not applicable.
-- **Password reset / change:** the dashboard has no reset flow, so there are no reset tokens to attack. Admin passwords are changed directly in the database.
+- **Admin login codes and password-reset codes on real WhatsApp/SMS:** only the mock provider was used. Delivery, the SMS fallback and the masked phone shown on screen need checking on staging (smoke test §6).
+- **Turnstile on a real domain:** the hostname/action check is unit-tested against Cloudflare's documented response; it hasn't been tried with real keys.
+- **Staging smoke test:** written (`scripts/staging-smoke.md` + read-only `scripts/staging-smoke.mjs`) but **not run**, as instructed.
+- **Upstash limiter store:** code path written; only the Postgres store was tested (no Upstash account).
+
+---
+
+## 7. CI pipeline (`.github/workflows/security.yml`)
+
+| Job | What it does | Fails the build when | Local result |
+|---|---|---|---|
+| unit | `npm ci`, typecheck, `npm test` (PGlite) | any test fails | 110 passed, 8 skipped |
+| concurrency | `postgres:17` service; `npm run test:concurrency` and `npm run test:realdb` | any test fails | 8/8 and 118/118 (embedded Postgres 17) |
+| e2e | Playwright desktop + mobile, incl. HTTP security specs | any test fails | 22 passed, 12 skipped (desktop-only) |
+| secrets | gitleaks over the full history (`fetch-depth: 0`) | any leak found | not run locally; regex scan: 0 hits |
+| sast | semgrep `p/nextjs p/typescript p/secrets p/owasp-top-ten` | any ERROR finding | not run locally |
+| audit | `npm audit --omit=dev --audit-level=high` | high/critical advisory | 0 vulnerabilities |
+| zap | ZAP baseline against a local build, rules in `.zap/rules.tsv` | a FAIL-level rule fires | not run locally |
+
+All jobs use mock providers and throwaway databases; no secrets are needed. Reports are uploaded as build artifacts. `.zap/rules.tsv` ignores only informational rules (timestamps, comments in minified bundles) and keeps the `style-src 'unsafe-inline'` finding as a warning (accepted, SEC-30).
+
+**Status: the workflow has not run yet** (branch not pushed). After the first run, record any semgrep/ZAP/gitleaks findings here as new SEC entries — fix them or mark them accepted with a reason.

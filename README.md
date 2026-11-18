@@ -55,6 +55,11 @@ See [`.env.example`](.env.example) for the full list with comments. Copy it to `
 | `OTP_PROVIDER` | `mock` | `mock`, `whatsapp` or `sms` (MSG91) |
 | `STORAGE_PROVIDER` | `db` | Gallery uploads: `db` (Postgres bytea) or `supabase` |
 | `CRON_SECRET` | – | Protects `/api/cron/*`. **Required in production.** |
+| `NEXT_PUBLIC_TURNSTILE_SITE_KEY` / `TURNSTILE_SECRET_KEY` | – | Bot check on "send code". **Required in production.** |
+| `TURNSTILE_HOSTNAMES` | site host | Hostnames a Turnstile token may come from. |
+| `ADMIN_2FA_REQUIRED` | on when live | Admin login needs a code sent to the admin's phone. |
+| `UPSTASH_REDIS_REST_URL` / `_TOKEN` | – | Optional shared limiter store (default: Postgres). |
+| `TEST_DATABASE_URL` | – | Real Postgres for the concurrency tests (tests only). |
 
 ## Tests
 
@@ -64,7 +69,28 @@ npm run test:unit        # pricing, slots/IST, OTP, signatures, refund rule, val
 npm run test:integration # real Postgres (in-memory PGlite) with the real constraint
 npx playwright install chromium
 npm run test:e2e         # builds into .next-e2e, starts a fresh server on :3100, runs desktop + mobile
+npm run test:concurrency # race tests on REAL Postgres, 25 parallel connections
+npm run test:realdb      # every Vitest suite on real Postgres
 ```
+
+### Concurrency tests on real Postgres
+
+The default Vitest run uses PGlite, which is single-connection — it can't show real races. `npm run test:concurrency`
+runs [`tests/concurrency`](tests/concurrency) against a real Postgres with a 25-connection pool. Each test works in its own
+fresh schema (dropped afterwards) and proves the requests really overlapped (it samples `pg_stat_activity` and fails unless
+several database connections were busy at the same moment).
+
+- **No setup:** leave `TEST_DATABASE_URL` empty — a throwaway Postgres 17 is started with `embedded-postgres` and deleted after.
+- **Docker:** `docker run -d -p 5433:5432 -e POSTGRES_PASSWORD=postgres postgres:17`, then
+  `TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5433/postgres npm run test:concurrency`.
+- **Supabase staging:** use the staging project's *direct* connection string and add its host to `TEST_DB_ALLOWED_HOSTS`.
+  The runner refuses any other non-local host, so it can't be pointed at production by mistake.
+- CI runs both commands against a `postgres:17` service container ([`.github/workflows/security.yml`](.github/workflows/security.yml)).
+
+Covered: 50 parallel bookings for one slot → exactly 1 succeeds (and quickly, no raw DB errors); overlapping 6–8 vs 7–9
+bookings → one wins; 20 limiter hits with limit 5 → exactly 5; 10 OTP sends to one number → 3 codes; one number booking
+in parallel with a limit of 2 → exactly 2; double cancel → one refund; duplicate webhooks → one confirmation, one message.
+
 
 Integration tests cover: 10 parallel bookings for one slot → exactly 1 succeeds; the exclusion constraint rejecting overlaps directly; idempotency keys; webhook delivered twice → one confirmation / one Payment / one WhatsApp message; bad signature and amount-mismatch webhooks; hold expiry freeing the slot (with and without the cron); payment after expiry → confirmed late or auto-refunded if the slot was taken; walk-in vs online clash; cancellation refund rules; OTP single use, attempt lock and rate limits; reminders.
 
@@ -77,7 +103,8 @@ E2E covers: home → book → OTP → pay → confirmation; payment failure → 
 - **Payment truth from the server only:** a booking is confirmed only after the checkout signature (HMAC-SHA256 of `order_id|payment_id`) or a signed webhook (`X-Razorpay-Signature`) is verified. `confirmPayment` locks the Payment row, so the callback and webhook can arrive in any order, any number of times. Paid after the hold expired → confirmed if the slot is still free, otherwise auto-refunded and the customer notified.
 - **Prices** are computed on the server from `PricingRule` + `Holiday` + `Settings`; the client only sends court, date and times.
 - **Times** are stored as UTC `timestamptz`; IST conversion is a fixed +05:30 offset (India has no DST), see [`lib/time.ts`](lib/time.ts).
-- **OTP:** 6 digits, stored as HMAC (bound to the phone), 5-minute expiry, single use, 5 attempts, constant-time compare; 3 sends / phone / 15 min and 10 / IP / hour.
+- **OTP:** 6 digits, stored as HMAC (bound to the phone), 5-minute expiry, single use, 5 attempts, constant-time compare; 3 sends / phone / 15 min; per-IP limits and separate daily caps for new and returning numbers are set in **Admin → Settings**. A phone verified on a device stays trusted there for 90 days (no new code), until the customer is blocked or the owner signs out their devices.
+- **Cancellation and refunds** come from one place — **Admin → Settings → Cancellation & refunds** — and every page and WhatsApp message reads it ([`lib/policy.ts`](lib/policy.ts)).
 - **Messages** are written to `MessageLog` first, then delivered in the background with 3 attempts and exponential backoff. Delivery failures never affect the booking. Dedupe keys make enqueueing idempotent.
 
 ## Switching providers to real
@@ -112,11 +139,18 @@ Set `MESSAGING_PROVIDER=bsp`, `BSP_API_URL`, `BSP_API_KEY` (and `BSP_AUTH_HEADER
 
 See [SECURITY_REPORT.md](SECURITY_REPORT.md) for the full review: findings, fixes, tests and what to set before launch. Security regression tests live in `tests/security/` (`npm run test:security`). On a live server (`NODE_ENV=production`, `DEMO_MODE=false`) the app **refuses to start** if demo admins, mock providers or missing secrets are still in place.
 
+## Admin accounts
+
+- **Two-step login:** after the password, a 6-digit code goes to the admin's phone (WhatsApp, SMS fallback). "Trust this device" skips it for 30 days; changing or resetting the password revokes every trusted device and session.
+- **Forgot password** (`/admin/forgot`): a reset code goes to the registered phone; the page answers the same whether or not the email exists.
+- **Team** (owner only, `/admin/team`): add staff with a temporary password (they must change it at first login), reset passwords, disable/enable, set phones.
+- **My account** (`/admin/account`): change your password and phone.
+
 ## Go-live checklist
 
 - [ ] **Razorpay KYC** completed; live keys + live webhook secret set; webhook URL points at the production domain.
 - [ ] **Meta Business verification** done and the WhatsApp number approved (display name review).
-- [ ] **WhatsApp templates approved** (all six names above, plus Telugu versions if used).
+- [ ] **WhatsApp templates approved** (all seven names above, plus Telugu versions if used).
 - [ ] SMS fallback: DLT registration + approved OTP template (MSG91), if using `OTP_PROVIDER=sms`.
 - [ ] `DEMO_MODE=false`, strong `APP_SECRET` and `CRON_SECRET`, `NEXT_PUBLIC_SITE_URL` set to the real domain.
 - [ ] **Custom domain** added in Vercel, HTTPS active, Razorpay website/app details updated to the domain.
@@ -125,6 +159,12 @@ See [SECURITY_REPORT.md](SECURITY_REPORT.md) for the full review: findings, fixe
 - [ ] **Legal pages reviewed** by the owner/lawyer: `/terms`, `/privacy`, `/refund-policy`, `/contact` (Razorpay checks these).
 - [ ] Pricing, hours, holidays and cancellation rules confirmed in the admin.
 - [ ] Database backups enabled (Supabase PITR or daily backups).
+- [ ] **Turnstile keys** set (the server won't start without them) and `TURNSTILE_HOSTNAMES` matches the domain.
+- [ ] **Owner phone** set in Team/My account (login codes and password resets go there).
+- [ ] **Admin 2FA on** (`ADMIN_2FA_REQUIRED` unset or `true`).
+- [ ] **OTP daily caps** (new / returning) and **per-IP limits** reviewed in Admin → Settings.
+- [ ] **CI green** on the release commit ([security workflow](.github/workflows/security.yml)).
+- [ ] **Staging smoke test** done ([`scripts/staging-smoke.md`](scripts/staging-smoke.md)).
 
 ## Project layout
 

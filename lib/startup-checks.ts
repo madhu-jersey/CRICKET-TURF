@@ -22,7 +22,17 @@ export function configProblems(e: CheckEnv): string[] {
   else if (!e.RAZORPAY_KEY_ID || !e.RAZORPAY_KEY_SECRET || !e.RAZORPAY_WEBHOOK_SECRET) p.push("RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET and RAZORPAY_WEBHOOK_SECRET must be set");
   if (!e.OTP_PROVIDER || e.OTP_PROVIDER === "mock") p.push("OTP_PROVIDER must be whatsapp or sms (the mock shows codes on screen)");
   if (!e.NEXT_PUBLIC_SITE_URL?.startsWith("https://")) p.push("NEXT_PUBLIC_SITE_URL must be the https:// address of the site");
+  if (!e.NEXT_PUBLIC_TURNSTILE_SITE_KEY || !e.TURNSTILE_SECRET_KEY) p.push("NEXT_PUBLIC_TURNSTILE_SITE_KEY and TURNSTILE_SECRET_KEY must be set (bot check on OTP sends)");
   return p;
+}
+
+/** Non-fatal warnings for a live site. */
+export function configWarnings(e: CheckEnv): string[] {
+  const live = e.NODE_ENV === "production" && (e.DEMO_MODE ?? "true").trim() === "false";
+  if (!live) return [];
+  const w: string[] = [];
+  if ((e.ADMIN_2FA_REQUIRED ?? "").trim() === "false") w.push("ADMIN_2FA_REQUIRED=false — dashboard logins do not need a phone code");
+  return w;
 }
 
 /** DB check: no admin account still accepts the published demo password. */
@@ -31,6 +41,8 @@ export async function demoAdminProblems(): Promise<string[]> {
   const db = await getDb();
   const rows = await db.select().from(schema.adminUsers).where(inArray(schema.adminUsers.email, DEMO_ADMIN_EMAILS));
   const p: string[] = [];
+  const owners = await db.select().from(schema.adminUsers).where(inArray(schema.adminUsers.role, ["OWNER"]));
+  if (!owners.some((o) => o.isActive && o.phone)) p.push("The OWNER account needs a phone number (for login codes and password reset)");
   for (const r of rows) {
     if (r.isActive && (await bcrypt.compare(DEMO_ADMIN_PASSWORD, r.passwordHash))) p.push(`Demo admin ${r.email} still has the demo password — delete it or change the password`);
   }
@@ -42,6 +54,7 @@ export async function runStartupChecks(e: CheckEnv = process.env) {
   if (!live) return;
   const problems = configProblems(e);
   if (!problems.length) problems.push(...(await demoAdminProblems()));
+  for (const w of configWarnings(e)) console.warn(`[startup] WARNING: ${w}`);
   if (problems.length) {
     console.error("\n[startup] Refusing to run in production:\n - " + problems.join("\n - ") + "\n");
     process.exit(1);

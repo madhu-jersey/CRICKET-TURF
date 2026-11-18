@@ -9,6 +9,7 @@ import { Reveal } from "@/components/site/misc";
 import { JsonLd } from "@/components/site/json-ld";
 import { formatMinutes, istDateKey, timeToMinutes } from "@/lib/time";
 import { inr } from "@/lib/utils";
+import { policySummary } from "@/lib/policy";
 
 export const dynamic = "force-dynamic";
 
@@ -270,7 +271,7 @@ export default async function HomePage() {
                 {f.q}
                 <span aria-hidden className="text-2xl text-flood transition group-open:rotate-45">+</span>
               </summary>
-              <p className="pb-5 text-mist">{f.a}</p>
+              <p className="pb-5 text-mist">{f.a === "POLICY" ? `Yes. ${policySummary(settings)}` : f.a}</p>
             </details>
           ))}
         </div>

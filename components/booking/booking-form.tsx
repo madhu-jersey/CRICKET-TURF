@@ -16,7 +16,8 @@ import type { Slot } from "@/lib/booking/slots";
 
 export type FormCourt = { id: string; name: string; sport: SportKey };
 export type FormDate = { key: string; label: string; sub: string };
-export type FormSettings = { advanceType: "FIXED" | "PERCENT"; advanceValue: number; cutoffHours: number; refundPercent: number; holdMinutes: number; offerPercent: number };
+/** policy: one sentence generated from Settings by lib/policy (never hardcoded here). */
+export type FormSettings = { advanceType: "FIXED" | "PERCENT"; advanceValue: number; policy: string; holdMinutes: number; offerPercent: number };
 
 type State = {
   sport: SportKey | null;
@@ -700,9 +701,7 @@ export function BookingForm({
             <>
               <div className="mt-4 rounded-2xl bg-zinc-50 p-4 text-sm text-zinc-700">
                 <p className="flex items-center gap-2 font-bold text-ink"><ShieldIcon className="size-4 text-pitch-600" /> Cancellation</p>
-                <p className="mt-1">
-                  Cancel <strong>{settings.cutoffHours} hours or more</strong> before your time → full refund of the advance. Cancel later → no refund.
-                </p>
+                <p className="mt-1" data-testid="form-policy">{settings.policy}</p>
               </div>
               <label className="tap mt-3 flex cursor-pointer items-center gap-3 rounded-2xl border-2 border-zinc-200 p-4">
                 <input type="checkbox" className="size-6 shrink-0 accent-pitch-600" checked={s.terms} onChange={(e) => update({ terms: e.target.checked })} data-testid="terms" />

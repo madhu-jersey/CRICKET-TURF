@@ -85,7 +85,8 @@ export const siteConfig = {
     },
     {
       q: "Can I cancel my booking?",
-      a: "Yes. Cancel at least 2 hours before your slot and the advance is refunded in full. If you cancel later than that, the advance is not refunded.",
+      // Answer is generated from Settings by lib/policy (see the home page FAQ).
+      a: "POLICY",
     },
     {
       q: "Do you provide equipment?",

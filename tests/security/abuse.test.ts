@@ -5,7 +5,8 @@
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { and, eq } from "drizzle-orm";
 import sharp from "sharp";
-import { createPgliteDb, setDbOverride, schema, type DB } from "@/db/client";
+import { setDbOverride, schema, type DB } from "@/db/client";
+import { createTestDb, type TestDb } from "../support/test-db";
 import { seedDatabase } from "@/db/seed";
 import { addDays, istDateKey, istToUtc } from "@/lib/time";
 import { flushBackground } from "@/lib/background";
@@ -25,6 +26,7 @@ import { env } from "@/lib/env";
 
 let db: DB;
 let close: () => Promise<void>;
+let testDb: TestDb;
 let cricketId: string;
 const NOW = new Date();
 const DATE = addDays(istDateKey(NOW), 10);
@@ -33,7 +35,8 @@ let n = 0;
 beforeEach(async () => {
   await flushBackground();
   if (close) await close();
-  ({ db, close } = await createPgliteDb("memory://"));
+  testDb = await createTestDb(); // PGlite, or real Postgres when TEST_DATABASE_URL is set
+  ({ db, close } = testDb);
   setDbOverride(db);
   await seedDatabase(db, NOW);
   cricketId = (await listCourts(db)).find((c) => c.sport === "CRICKET")!.id;
@@ -63,8 +66,11 @@ describe("SEC-04 booking races", () => {
   });
 
   it("the exclusion constraint exists in the migrated database", async () => {
-    const res = (await db.execute(`select conname from pg_constraint where conname = 'no_overlap'` as never)) as unknown as { rows: unknown[] };
-    expect(res.rows).toHaveLength(1);
+    expect(
+      await testDb.rows(
+        `select c.conname from pg_constraint c join pg_namespace n on n.oid = c.connamespace where c.conname = 'no_overlap' and c.contype = 'x' and n.nspname = current_schema()`,
+      ),
+    ).toHaveLength(1);
   });
 
   it("walk-in on a held slot is rejected", async () => {
@@ -171,8 +177,8 @@ describe("SEC-07/08 OTP flooding and rate limiting", () => {
     expect(rows).toHaveLength(3);
   });
 
-  it("global daily cap stops sends across many numbers/networks and alerts the owner once", async () => {
-    await db.update(schema.settings).set({ otpDailyCap: 10 });
+  it("daily cap (new-number pool) stops sends across many numbers/networks; owner alerted once at 80% and once at 100%", async () => {
+    await db.update(schema.settings).set({ otpDailyCapNew: 10 });
     const r: string[] = [];
     for (let i = 0; i < 13; i++) r.push(await errCode(sendOtp(`+91984440${String(1000 + i)}`, `10.1.${i}.1`)));
     expect(r.filter((x) => x === "OK")).toHaveLength(10);
@@ -180,7 +186,7 @@ describe("SEC-07/08 OTP flooding and rate limiting", () => {
     await flushBackground();
     await new Promise((res) => setTimeout(res, 50));
     const alerts = await db.select().from(schema.messageLogs).where(eq(schema.messageLogs.template, "admin_alert"));
-    expect(alerts).toHaveLength(1);
+    expect(alerts.map((a) => a.dedupeKey!.split(":")[1]).sort()).toEqual(["otp_cap_new_100", "otp_cap_new_80"]);
   });
 
   it("phone formatting tricks map to one number (one per-number limit)", () => {

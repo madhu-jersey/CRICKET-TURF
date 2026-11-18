@@ -35,6 +35,9 @@ export function CustomerControls({ id, isBlocked, blockedReason, whatsappOptIn }
           Block online booking
         </Button>
       )}
+      <Button variant="light" size="sm" loading={busy === "td"} onClick={() => patch("td", { revokeTrustedDevices: true })}>
+        Sign out trusted devices
+      </Button>
       <Button variant="light" size="sm" loading={busy === "wa"} onClick={() => patch("wa", { whatsappOptIn: !whatsappOptIn })}>
         {whatsappOptIn ? "Stop WhatsApp messages" : "Allow WhatsApp messages"}
       </Button>

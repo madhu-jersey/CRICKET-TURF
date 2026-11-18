@@ -1,10 +1,11 @@
 /**
  * Integration tests against a real Postgres (PGlite in memory) with the real schema, exclusion
- * constraint and seed data. (Always PGlite; to run against a server Postgres, swap createPgliteDb for a postgres-js client.)
+ * constraint and seed data. Uses PGlite by default, or a real Postgres when TEST_DATABASE_URL is set.
  */
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { and, eq } from "drizzle-orm";
-import { createPgliteDb, setDbOverride, pgErrorCode, schema, type DB } from "@/db/client";
+import { setDbOverride, pgErrorCode, schema, type DB } from "@/db/client";
+import { createTestDb, type TestDb } from "../support/test-db";
 import { seedDatabase } from "@/db/seed";
 import { addDays, istDateKey, istToUtc } from "@/lib/time";
 import { AppError } from "@/lib/errors";
@@ -24,6 +25,7 @@ import { sendOtp, verifyOtp } from "@/lib/otp-service";
 
 let db: DB;
 let close: () => Promise<void>;
+let testDb: TestDb;
 let cricketId: string;
 const NOW = new Date();
 const DATE = addDays(istDateKey(NOW), 10);
@@ -31,7 +33,8 @@ const DATE = addDays(istDateKey(NOW), 10);
 beforeEach(async () => {
   await flushBackground();
   if (close) await close();
-  ({ db, close } = await createPgliteDb("memory://"));
+  testDb = await createTestDb(); // PGlite, or real Postgres when TEST_DATABASE_URL is set
+  ({ db, close } = testDb);
   setDbOverride(db);
   await seedDatabase(db, NOW);
   cricketId = (await listCourts(db)).find((c) => c.sport === "CRICKET")!.id;

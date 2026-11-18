@@ -2,7 +2,7 @@
  * Drizzle table definitions. These mirror db/migrations/*.sql exactly; the SQL files are the
  * source of truth (they also contain the exclusion constraint and CHECKs Drizzle can't express).
  */
-import { pgTable, text, integer, boolean, timestamp, jsonb, bigserial, date, customType } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, boolean, timestamp, jsonb, bigserial, bigint, date, customType } from "drizzle-orm/pg-core";
 
 const bytea = customType<{ data: Uint8Array; driverData: Uint8Array }>({ dataType: () => "bytea" });
 
@@ -69,6 +69,7 @@ export const customers = pgTable("Customer", {
   isBlocked: boolean("isBlocked").notNull().default(false),
   blockedAt: ts("blockedAt"),
   blockedReason: text("blockedReason"),
+  trustEpoch: integer("trustEpoch").notNull().default(0),
   createdAt: ts("createdAt").notNull().defaultNow(),
 });
 
@@ -152,6 +153,10 @@ export const adminUsers = pgTable("AdminUser", {
   passwordHash: text("passwordHash").notNull(),
   role: text("role").$type<AdminRole>().notNull(),
   isActive: boolean("isActive").notNull().default(true),
+  phone: text("phone"),
+  mustChangePassword: boolean("mustChangePassword").notNull().default(false),
+  trustEpoch: integer("trustEpoch").notNull().default(0),
+  passwordChangedAt: ts("passwordChangedAt"),
   createdAt: ts("createdAt").notNull().defaultNow(),
 });
 
@@ -179,14 +184,23 @@ export const settings = pgTable("Settings", {
   advanceType: text("advanceType").$type<"FIXED" | "PERCENT">().notNull(),
   advanceValue: integer("advanceValue").notNull(),
   holdMinutes: integer("holdMinutes").notNull(),
-  cancellationCutoffHours: integer("cancellationCutoffHours").notNull(),
+  refundCutoffHours: integer("refundCutoffHours").notNull(),
+  cancelCutoffHours: integer("cancelCutoffHours").notNull().default(0),
+  refundPercentAfterCutoff: integer("refundPercentAfterCutoff").notNull().default(0),
   refundPercentBeforeCutoff: integer("refundPercentBeforeCutoff").notNull(),
   maxDaysAhead: integer("maxDaysAhead").notNull(),
   newCustomerDiscountPercent: integer("newCustomerDiscountPercent").notNull().default(10),
   maxActiveBookingsPerPhone: integer("maxActiveBookingsPerPhone").notNull().default(2),
   maxBookingsPerPhonePerDay: integer("maxBookingsPerPhonePerDay").notNull().default(4),
   noShowBlockThreshold: integer("noShowBlockThreshold").notNull().default(3),
-  otpDailyCap: integer("otpDailyCap").notNull().default(300),
+  otpDailyCapNew: integer("otpDailyCapNew").notNull().default(200),
+  otpDailyCapReturning: integer("otpDailyCapReturning").notNull().default(300),
+  otpCapBoost: integer("otpCapBoost").notNull().default(0),
+  otpCapBoostDate: date("otpCapBoostDate", { mode: "string" }),
+  otpSendPerIpHour: integer("otpSendPerIpHour").notNull().default(30),
+  otpVerifyPerIpHour: integer("otpVerifyPerIpHour").notNull().default(60),
+  bookingPerIpHour: integer("bookingPerIpHour").notNull().default(60),
+  cancelPerIpHour: integer("cancelPerIpHour").notNull().default(30),
   ownerAlertPhone: text("ownerAlertPhone"),
   businessName: text("businessName").notNull(),
   address: text("address").notNull(),
@@ -222,6 +236,31 @@ export const storedFiles = pgTable("StoredFile", {
   id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
   contentType: text("contentType").notNull(),
   data: bytea("data").notNull(),
+  createdAt: ts("createdAt").notNull().defaultNow(),
+});
+
+export const counters = pgTable("Counter", {
+  key: text("key").primaryKey(),
+  count: integer("count").notNull().default(0),
+  expiresAt: ts("expiresAt").notNull(),
+});
+
+export const cacheVersions = pgTable("CacheVersion", {
+  key: text("key").primaryKey(),
+  version: bigint("version", { mode: "number" }).notNull().default(0),
+  updatedAt: ts("updatedAt").notNull().defaultNow(),
+});
+
+export const adminCodes = pgTable("AdminCode", {
+  id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+  adminId: text("adminId").notNull(),
+  purpose: text("purpose").$type<"RESET" | "LOGIN">().notNull(),
+  codeHash: text("codeHash").notNull(),
+  expiresAt: ts("expiresAt").notNull(),
+  attempts: integer("attempts").notNull().default(0),
+  consumedAt: ts("consumedAt"),
+  trustDevice: boolean("trustDevice").notNull().default(false),
+  ip: text("ip"),
   createdAt: ts("createdAt").notNull().defaultNow(),
 });
 

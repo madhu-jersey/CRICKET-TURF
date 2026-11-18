@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { BookingForm } from "@/components/booking/booking-form";
+import { policySummary } from "@/lib/policy";
 import { getSettings, listCourts, startingPrices } from "@/lib/booking/data";
 import { bookableDates } from "@/lib/booking/slots";
 import { istDateKey, istToUtc, relativeDayLabel, formatDateShort } from "@/lib/time";
@@ -40,8 +41,7 @@ export default async function BookPage({ searchParams }: { searchParams: Promise
           settings={{
             advanceType: settings.advanceType,
             advanceValue: settings.advanceValue,
-            cutoffHours: settings.cancellationCutoffHours,
-            refundPercent: settings.refundPercentBeforeCutoff,
+            policy: policySummary(settings),
             holdMinutes: settings.holdMinutes,
             offerPercent: settings.newCustomerDiscountPercent,
           }}

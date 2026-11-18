@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { LegalPage } from "@/components/site/legal";
 import { getSettings } from "@/lib/booking/data";
 import { siteConfig } from "@/config/site";
+import { policyLines } from "@/lib/policy";
 
 export const dynamic = "force-dynamic";
 export const metadata: Metadata = { title: "Cancellation & refund policy", alternates: { canonical: "/refund-policy" } };
@@ -14,11 +15,11 @@ export default async function RefundPolicy() {
       <h2>Advance payment</h2>
       <p>To confirm a slot you pay an advance online ({s.advanceType === "FIXED" ? `₹${s.advanceValue} per booking` : `${s.advanceValue}% of the booking total`}). The remaining balance is paid at the venue by cash or UPI before play.</p>
       <h2>Cancelling a booking</h2>
-      <ul>
+      <ul data-testid="policy-lines">
         <li>Cancel from your booking page or from <a href="/my-bookings">My bookings</a> after verifying your phone number.</li>
-        <li>Cancel <strong>{s.cancellationCutoffHours} hours or more</strong> before your slot starts: {s.refundPercentBeforeCutoff}% of the advance is refunded.</li>
-        <li>Cancel <strong>less than {s.cancellationCutoffHours} hours</strong> before your slot starts: the advance is not refunded.</li>
-        <li>Slots that have already started cannot be cancelled online.</li>
+        {policyLines(s).map((line) => (
+          <li key={line}>{line}</li>
+        ))}
       </ul>
       <h2>Refund timelines</h2>
       <p>Refunds go back to the original payment method through our payment partner (Razorpay) and usually reach your account within 5–7 working days.</p>

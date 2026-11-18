@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { requireAdminPage } from "@/lib/auth/admin";
 import { overview } from "@/lib/admin/reports";
+import { otpCapUsage } from "@/lib/otp-service";
 import { Card, PageHeader } from "@/components/admin/shell";
 import { formatTimeRange, formatDateShort, istToUtc, formatWeekday } from "@/lib/time";
 import { inr } from "@/lib/utils";
@@ -11,7 +12,7 @@ const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
 export default async function OverviewPage() {
   await requireAdminPage("OWNER");
-  const o = await overview();
+  const [o, otp] = await Promise.all([overview(), otpCapUsage()]);
   const maxRev = Math.max(1, ...o.revenueByDay.map((d) => d.advance + d.balance));
   const maxHeat = Math.max(1, ...o.heat.flat());
   const weekTotal = o.revenueByDay.reduce((s, d) => s + d.advance + d.balance, 0);
@@ -82,6 +83,27 @@ export default async function OverviewPage() {
           <Link href="/admin/schedule" className="mt-2 inline-block text-sm font-semibold underline">Open schedule →</Link>
         </Card>
       </div>
+
+      <Card title="OTP codes sent today" className="mt-4">
+        <div className="grid gap-3 sm:grid-cols-2" data-testid="otp-usage">
+          {(["new", "returning"] as const).map((pool) => {
+            const u = otp[pool];
+            const pct = Math.min(100, Math.round((u.used / Math.max(1, u.cap)) * 100));
+            return (
+              <div key={pool}>
+                <div className="flex justify-between text-sm">
+                  <span>{pool === "new" ? "New numbers" : "Returning customers"}</span>
+                  <span className="font-bold tabular-nums">{u.used} / {u.cap}</span>
+                </div>
+                <div className="mt-1 h-2 rounded-full bg-zinc-100">
+                  <div className={`h-full rounded-full ${pct >= 100 ? "bg-red-500" : pct >= 80 ? "bg-amber-500" : "bg-pitch-600"}`} style={{ width: `${pct}%` }} />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        <p className="mt-2 text-xs text-zinc-500">Each pool pauses when full. Raise today&apos;s limit in Settings if it&apos;s real demand.</p>
+      </Card>
 
       <Card title="Busiest hours — last 4 weeks" className="mt-4">
         <div className="overflow-x-auto">

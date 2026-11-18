@@ -6,7 +6,7 @@ import { Alert } from "@/components/ui/field";
 import { api, ApiError, cn } from "@/lib/utils";
 
 type Target = { phone: string } | { bookingCode: string };
-type SendRes = { maskedPhone: string; resendIn: number; devCode?: string };
+type SendRes = { maskedPhone: string; resendIn: number; devCode?: string; trusted?: boolean };
 
 /**
  * Sends a 6-digit OTP and verifies it. 6 boxes with auto-advance, backspace navigation,
@@ -45,7 +45,7 @@ export function OtpVerify({
     const w = window as unknown as { turnstile?: { render: (el: HTMLElement, o: Record<string, unknown>) => string; reset: (id: string) => void } };
     const render = () => {
       if (!w.turnstile || !captchaBox.current || widgetId.current) return;
-      widgetId.current = w.turnstile.render(captchaBox.current, { sitekey: siteKey, callback: (t: string) => setCaptcha(t), "expired-callback": () => setCaptcha(null) });
+      widgetId.current = w.turnstile.render(captchaBox.current, { sitekey: siteKey, action: "otp_send", callback: (t: string) => setCaptcha(t), "expired-callback": () => setCaptcha(null) });
     };
     if (w.turnstile) return render();
     const s = document.createElement("script");
@@ -66,6 +66,11 @@ export function OtpVerify({
     setError(null);
     try {
       const r = await api<SendRes>("/api/otp/send", { method: "POST", json: { ...JSON.parse(targetKey), turnstileToken: captcha ?? undefined } });
+      if (r.trusted) {
+        // This phone was verified on this device before: no code needed.
+        onVerified(r.maskedPhone);
+        return;
+      }
       setSent(r);
       setCooldown(r.resendIn);
       setDigits(Array(6).fill(""));

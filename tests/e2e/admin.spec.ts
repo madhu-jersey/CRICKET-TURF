@@ -8,6 +8,10 @@ async function login(page: Page) {
   await page.getByLabel("Email").fill("owner@demo.com");
   await page.getByLabel("Password").fill("Demo@1234");
   await page.getByRole("button", { name: "Sign in" }).click();
+  // Two-factor step (the e2e server runs with ADMIN_2FA_REQUIRED=true; demo shows the code).
+  const code = (await page.getByTestId("admin-dev-code").locator("strong").textContent())!.trim();
+  await page.getByLabel("Login code").fill(code);
+  await page.getByRole("button", { name: "Verify code" }).click();
   await expect(page.getByRole("heading", { name: "Overview" })).toBeVisible();
 }
 

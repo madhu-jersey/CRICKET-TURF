@@ -12,18 +12,20 @@
  */
 import "server-only";
 import { and, eq, gt, inArray, isNull, lte, lt, sql, desc, count } from "drizzle-orm";
-import { getDb, pgErrorCode, PG_EXCLUSION_VIOLATION, PG_UNIQUE_VIOLATION, schema, type Queryable, type Tx } from "@/db/client";
+import { getDb, pgErrorCode, PG_EXCLUSION_VIOLATION, PG_UNIQUE_VIOLATION, schema, transactionWithRetry, type Queryable, type Tx } from "@/db/client";
 import { siteConfig } from "@/config/site";
 import { AppError, SLOT_TAKEN_MESSAGE } from "@/lib/errors";
 import { priceBreakdown, formatINR } from "@/lib/pricing";
-import { computeRefund, pickConsecutive, type Slot } from "@/lib/booking/slots";
+import { pickConsecutive, type Slot } from "@/lib/booking/slots";
+import { canCancelOnline, cancelledRefundText, hoursText, policySummary, refundFor } from "@/lib/policy";
 import { getBookingByCode, getBookingById, getSettings, loadAvailability, netPaid } from "@/lib/booking/data";
 import { getPaymentProvider, type CreatedOrder } from "@/lib/providers/payment";
 import { enqueueMessage, dispatchInBackground, dispatchMessage } from "@/lib/messaging";
 import { runInBackground } from "@/lib/background";
+import { invalidateAvailability } from "@/lib/booking/availability-cache";
 import { audit } from "@/lib/audit";
 import { randomCode } from "@/lib/security";
-import { formatDate, formatTimeRange, formatTime } from "@/lib/time";
+import { formatDate, formatTimeRange, formatTime, istDateKey } from "@/lib/time";
 import { env } from "@/lib/env";
 import type { Booking, BookingSource, Payment, SettingsRow } from "@/db/schema";
 
@@ -84,6 +86,17 @@ async function upsertCustomer(tx: Queryable, phone: string, name: string, whatsa
     .onConflictDoUpdate({ target: schema.customers.phone, set: { name } })
     .returning();
   return c;
+}
+
+/**
+ * Serialises booking inserts for one court + IST day. Without it, many simultaneous inserts into
+ * the same exclusion-constraint range wait on each other's uncommitted rows and Postgres has to
+ * break the cycles as deadlocks (1 s each) — 50 parallel requests took up to 60 s and some returned
+ * raw errors. With the lock they queue, and each loser fails fast with 23P01 ("slot taken").
+ * The exclusion constraint is still what guarantees correctness. [SEC-33]
+ */
+async function lockCourtDay(tx: Tx, courtId: string, dateKey: string) {
+  await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`slot:${courtId}:${dateKey}`}))`);
 }
 
 /** Flip stale (time-expired) holds overlapping [start, end) on a court to EXPIRED. */
@@ -189,9 +202,10 @@ export async function createOnlineHold(
 
   let booking: Booking;
   try {
-    booking = await db.transaction(async (tx) => {
+    booking = await transactionWithRetry(db, async (tx) => {
       const customer = await upsertCustomer(tx, input.phone, input.name, input.whatsappOptIn, now);
       await enforceBookingLimits(tx, customer, settings, now);
+      await lockCourtDay(tx, input.courtId, input.date);
       await expireStaleOverlapping(tx, input.courtId, startAt, endAt, now);
       // First-booking offer, decided inside the transaction while the customer row is locked,
       // so two parallel holds from the same new number can't both get it.
@@ -237,6 +251,7 @@ export async function createOnlineHold(
     }
     throw e;
   }
+  await invalidateAvailability(input.courtId, booking.startAt);
   if (booking.status === "CONFIRMED") notifyConfirmed(booking.id);
   return holdResponseFor(booking.bookingCode, input.phone, now);
 }
@@ -301,7 +316,7 @@ export async function confirmPayment(
   now = new Date(),
 ): Promise<{ bookingCode: string; outcome: ConfirmOutcome }> {
   const db = await getDb();
-  const result = await db.transaction(async (tx) => {
+  const result = await transactionWithRetry(db, async (tx) => {
     const [payment] = await tx.select().from(schema.payments).where(eq(schema.payments.providerOrderId, input.orderId)).for("update");
     if (!payment) throw new AppError("NOT_FOUND", "Unknown payment order.");
     const [booking] = await tx.select().from(schema.bookings).where(eq(schema.bookings.id, payment.bookingId)).for("update");
@@ -327,6 +342,7 @@ export async function confirmPayment(
       // exclusion violation doesn't abort the outer transaction).
       try {
         await tx.transaction(async (sp) => {
+          await lockCourtDay(sp, booking.courtId, istDateKey(booking.startAt));
           await expireStaleOverlapping(sp, booking.courtId, booking.startAt, booking.endAt, now);
           if (booking.startAt.getTime() <= now.getTime()) throw new AppError("NOT_ALLOWED", "Slot already started");
           const blocked = await sp
@@ -357,6 +373,7 @@ export async function confirmPayment(
   });
 
   const code = result.booking.bookingCode;
+  if (result.outcome !== "ALREADY_PROCESSED" && result.outcome !== "CONFIRMED") await invalidateAvailability(result.booking.courtId, result.booking.startAt);
   if (result.outcome === "CONFIRMED" || result.outcome === "CONFIRMED_LATE") {
     notifyConfirmed(result.booking.id);
   } else if (result.outcome === "REFUND_SLOT_TAKEN" || result.outcome === "REFUND_NOT_BOOKABLE") {
@@ -483,8 +500,9 @@ export async function previewCustomerRefund(code: string, now = new Date()) {
   const paid = netPaid(d.payments);
   return {
     paid,
-    refund: computeRefund({ startAt: d.booking.startAt, now, paidAmount: paid, cutoffHours: s.cancellationCutoffHours, refundPercent: s.refundPercentBeforeCutoff }),
-    cutoffHours: s.cancellationCutoffHours,
+    refund: refundFor(s, { startAt: d.booking.startAt, now, paidAmount: paid }),
+    canCancel: canCancelOnline(s, d.booking.startAt, now),
+    policy: policySummary(s),
   };
 }
 
@@ -498,13 +516,20 @@ export async function cancelBooking(
     const [b] = await tx.select().from(schema.bookings).where(eq(schema.bookings.id, input.bookingId)).for("update");
     if (!b) throw new AppError("NOT_FOUND", "Booking not found.");
     if (b.status !== "CONFIRMED" && b.status !== "PENDING_PAYMENT") throw new AppError("NOT_ALLOWED", `A ${b.status.toLowerCase().replace("_", " ")} booking can't be cancelled.`);
-    if (input.by === "CUSTOMER" && b.startAt.getTime() <= now.getTime()) throw new AppError("NOT_ALLOWED", "This slot has already started and can't be cancelled online.");
+    if (input.by === "CUSTOMER" && !canCancelOnline(settings, b.startAt, now)) {
+      throw new AppError(
+        "NOT_ALLOWED",
+        settings.cancelCutoffHours > 0
+          ? `Online cancelling closes ${hoursText(settings.cancelCutoffHours)} before the slot. Please call the venue.`
+          : "This slot has already started and can't be cancelled online.",
+      );
+    }
     const payments = await tx.select().from(schema.payments).where(eq(schema.payments.bookingId, b.id));
     const paid = netPaid(payments);
     let due = 0;
     switch (input.refund.mode) {
       case "POLICY":
-        due = computeRefund({ startAt: b.startAt, now, paidAmount: paid, cutoffHours: settings.cancellationCutoffHours, refundPercent: settings.refundPercentBeforeCutoff });
+        due = refundFor(settings, { startAt: b.startAt, now, paidAmount: paid });
         break;
       case "FULL":
         due = paid;
@@ -524,6 +549,7 @@ export async function cancelBooking(
     await audit(tx, { actor: input.actor, action: "booking.cancel", entity: "Booking", entityId: b.id, before: { status: b.status }, after: { status: "CANCELLED", refundDue: due, mode: input.refund.mode } });
     return { booking: updated, refundDue: due };
   });
+  await invalidateAvailability(booking.courtId, booking.startAt);
 
   let refunded = 0;
   let refundError: string | undefined;
@@ -580,8 +606,9 @@ export async function createAdminBooking(
   const startAt = new Date(pick.slots[0].startAt);
   const endAt = new Date(pick.slots[pick.slots.length - 1].endAt);
   try {
-    const booking = await db.transaction(async (tx) => {
+    const booking = await transactionWithRetry(db, async (tx) => {
       const customer = await upsertCustomer(tx, input.phone, input.name, input.whatsappOptIn || undefined, now);
+      await lockCourtDay(tx, input.courtId, input.date);
       await expireStaleOverlapping(tx, input.courtId, startAt, endAt, now);
       const [b] = await tx
         .insert(schema.bookings)
@@ -608,6 +635,7 @@ export async function createAdminBooking(
       await audit(tx, { actor, action: "booking.create_admin", entity: "Booking", entityId: b.id, after: { code: b.bookingCode, source: b.source, total, received: input.amountReceived } });
       return b;
     });
+    await invalidateAvailability(booking.courtId, booking.startAt);
     notifyConfirmed(booking.id);
     return booking;
   } catch (e) {
@@ -649,7 +677,7 @@ export async function setBookingOutcome(bookingId: string, outcome: "COMPLETED" 
         if (n >= settings.noShowBlockThreshold) {
           const blocked = await tx
             .update(schema.customers)
-            .set({ isBlocked: true, blockedAt: now, blockedReason: `${n} no-shows` })
+            .set({ isBlocked: true, blockedAt: now, blockedReason: `${n} no-shows`, trustEpoch: sql`${schema.customers.trustEpoch} + 1` })
             .where(and(eq(schema.customers.id, b.customerId), eq(schema.customers.isBlocked, false)))
             .returning({ id: schema.customers.id });
           if (blocked.length) await audit(tx, { actor: "system", action: "customer.auto_block", entity: "Customer", entityId: b.customerId, after: { noShows: n } });
@@ -667,7 +695,7 @@ export async function createBlocks(
   now = new Date(),
 ) {
   const db = await getDb();
-  return db.transaction(async (tx) => {
+  const created = await db.transaction(async (tx) => {
     const conflicts: string[] = [];
     for (const r of input.ranges) {
       if (r.endAt <= r.startAt) throw new AppError("VALIDATION", "End time must be after start time.");
@@ -692,6 +720,8 @@ export async function createBlocks(
     await audit(tx, { actor, action: "block.create", entity: "BlockedSlot", entityId: rows[0]?.id, after: { courtId: input.courtId, count: rows.length, reason: input.reason, recurrenceGroupId: input.recurrenceGroupId ?? null } });
     return rows;
   });
+  for (const r of created) await invalidateAvailability(r.courtId, r.startAt);
+  return created;
 }
 
 // ───────────────────────────── Crons ─────────────────────────────
@@ -702,7 +732,8 @@ export async function expireHolds(now = new Date()) {
     .update(schema.bookings)
     .set({ status: "EXPIRED", updatedAt: now })
     .where(and(eq(schema.bookings.status, "PENDING_PAYMENT"), lte(schema.bookings.holdExpiresAt, now)))
-    .returning({ id: schema.bookings.id });
+    .returning({ id: schema.bookings.id, courtId: schema.bookings.courtId, startAt: schema.bookings.startAt });
+  for (const r of rows) await invalidateAvailability(r.courtId, r.startAt);
   return rows.length;
 }
 
@@ -775,6 +806,7 @@ export function notifyConfirmed(bookingId: string, opts: { resend?: boolean } = 
             advance: formatINR(netPaid(d.payments)),
             balance: formatINR(b.balancePaidAt ? 0 : b.balanceAmount),
             map: siteConfig.directionsUrl,
+            policy: policySummary(settings),
           },
           dedupeKey: `booking_confirmed:${bookingId}${suffix}`,
         }),
@@ -823,7 +855,7 @@ export function notifyCancelled(bookingId: string, refund: number, dedupe?: stri
           code: d.booking.bookingCode,
           date: formatDate(d.booking.startAt),
           time: formatTimeRange(d.booking.startAt, d.booking.endAt),
-          refund: refund > 0 ? formatINR(refund) : "No refund (within cancellation window)",
+          refund: cancelledRefundText(await getSettings(db), refund, formatINR(refund)),
         },
         dedupeKey: dedupe ?? `booking_cancelled:${bookingId}`,
       });

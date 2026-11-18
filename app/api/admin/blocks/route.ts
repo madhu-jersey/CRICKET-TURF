@@ -9,6 +9,7 @@ import { addDays, dayOfWeek, istToUtc, timeToMinutes } from "@/lib/time";
 import { closeTimeSchema, dateKeySchema, idSchema, sanitizeText, timeSchema } from "@/lib/validation";
 import { audit } from "@/lib/audit";
 import { randomToken } from "@/lib/security";
+import { invalidateAvailability } from "@/lib/booking/availability-cache";
 
 const body = z.object({
   courtId: idSchema,
@@ -57,6 +58,7 @@ export const DELETE = adminRoute("OWNER", async (req, { admin }) => {
       ? await db.delete(schema.blockedSlots).where(eq(schema.blockedSlots.id, id)).returning()
       : [];
   if (!removed.length) throw new AppError("NOT_FOUND", "Block not found");
+  for (const r of removed) await invalidateAvailability(r.courtId, r.startAt);
   await audit(db, { actor: admin.email, action: "block.delete", entity: "BlockedSlot", entityId: group ?? id, before: removed.map((r) => ({ id: r.id, startAt: r.startAt, endAt: r.endAt, reason: r.reason })) });
   return NextResponse.json({ removed: removed.length });
 });

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { bookableDates, computeRefund, generateSlots, isBookingActive, pickConsecutive } from "@/lib/booking/slots";
+import { bookableDates, generateSlots, isBookingActive, pickConsecutive } from "@/lib/booking/slots";
+import { canCancelOnline, refundFor } from "@/lib/policy";
 import { addDays, istDateKey, istToUtc, istTimeHHMM, formatMinutes } from "@/lib/time";
 import type { PricingRuleLite } from "@/lib/pricing";
 
@@ -107,18 +108,25 @@ describe("pickConsecutive", () => {
   });
 });
 
-describe("computeRefund (cancellation policy)", () => {
+describe("refundFor (cancellation policy)", () => {
   const startAt = new Date("2026-11-20T12:30:00Z");
-  const args = { startAt, paidAmount: 300, cutoffHours: 24, refundPercent: 100 };
+  const policy = { cancelCutoffHours: 0, refundCutoffHours: 24, refundPercentBeforeCutoff: 100, refundPercentAfterCutoff: 0 };
+  const at = (hoursBefore: number, extraMs = 0) => new Date(startAt.getTime() - hoursBefore * 3_600_000 + extraMs);
   it("refunds fully at or before the cutoff", () => {
-    expect(computeRefund({ ...args, now: new Date(startAt.getTime() - 48 * 3_600_000) })).toBe(300);
-    expect(computeRefund({ ...args, now: new Date(startAt.getTime() - 24 * 3_600_000) })).toBe(300);
+    expect(refundFor(policy, { startAt, paidAmount: 300, now: at(48) })).toBe(300);
+    expect(refundFor(policy, { startAt, paidAmount: 300, now: at(24) })).toBe(300);
   });
-  it("refunds nothing inside the cutoff", () => {
-    expect(computeRefund({ ...args, now: new Date(startAt.getTime() - 24 * 3_600_000 + 1) })).toBe(0);
-    expect(computeRefund({ ...args, now: new Date(startAt.getTime() - 3_600_000) })).toBe(0);
+  it("uses the after-cutoff percent inside the cutoff", () => {
+    expect(refundFor(policy, { startAt, paidAmount: 300, now: at(24, 1) })).toBe(0);
+    expect(refundFor(policy, { startAt, paidAmount: 300, now: at(1) })).toBe(0);
+    expect(refundFor({ ...policy, refundPercentAfterCutoff: 25 }, { startAt, paidAmount: 300, now: at(1) })).toBe(75);
   });
-  it("applies the configured refund percent", () => {
-    expect(computeRefund({ ...args, refundPercent: 50, now: new Date(startAt.getTime() - 72 * 3_600_000) })).toBe(150);
+  it("applies the configured before-cutoff percent", () => {
+    expect(refundFor({ ...policy, refundPercentBeforeCutoff: 50 }, { startAt, paidAmount: 300, now: at(72) })).toBe(150);
+  });
+  it("online cancelling closes at the cancel cutoff", () => {
+    expect(canCancelOnline(policy, startAt, at(0.5))).toBe(true);
+    expect(canCancelOnline(policy, startAt, at(0))).toBe(false);
+    expect(canCancelOnline({ ...policy, cancelCutoffHours: 2 }, startAt, at(1))).toBe(false);
   });
 });

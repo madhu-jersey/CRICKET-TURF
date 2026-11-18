@@ -1,0 +1,12 @@
+# ZAP baseline rule overrides: <rule id>	<IGNORE|WARN|FAIL>	<reason>. Tab-separated.
+# Anything not listed uses ZAP defaults (WARN). Only documented, reviewed exceptions belong here.
+10096	IGNORE	Timestamp disclosure: booking times and dates are shown to customers on purpose
+10027	IGNORE	Information disclosure - suspicious comments: flags words in minified Next.js bundles
+10109	IGNORE	Modern web application: informational only
+10049	IGNORE	Storable/cacheable content: informational; private pages send no-store
+10055	WARN	CSP: style-src allows unsafe-inline (needed for Next.js/Tailwind runtime styles; scripts use a per-request nonce) - recorded as accepted in SECURITY_REPORT.md
+10202	FAIL	Absence of anti-CSRF tokens
+10038	FAIL	Content Security Policy header not set
+10020	FAIL	Anti-clickjacking header missing
+10021	FAIL	X-Content-Type-Options header missing
+10035	FAIL	Strict-Transport-Security header missing (only on https; local run is http so ZAP will not raise it)

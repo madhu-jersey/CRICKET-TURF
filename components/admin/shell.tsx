@@ -42,6 +42,8 @@ const NAV: { href: string; label: string; owner?: boolean }[] = [
   { href: "/admin/messages", label: "Message outbox", owner: true },
   { href: "/admin/settings", label: "Settings", owner: true },
   { href: "/admin/audit", label: "Audit log", owner: true },
+  { href: "/admin/team", label: "Team", owner: true },
+  { href: "/admin/account", label: "My account" },
 ];
 
 export function AdminShell({ children, name, email, role }: { children: React.ReactNode; name: string; email: string; role: "OWNER" | "STAFF" }) {

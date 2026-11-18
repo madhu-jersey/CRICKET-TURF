@@ -105,10 +105,3 @@ export function pickConsecutive(slots: readonly Slot[], times: readonly string[]
   if (bad) return { ok: false, error: "UNAVAILABLE", time: bad.slot.time };
   return { ok: true, slots: picked.map((p) => p.slot) };
 }
-
-/** Refund owed when a customer cancels: full refund % if at least `cutoffHours` before start, else 0. */
-export function computeRefund(input: { startAt: Date; now: Date; paidAmount: number; cutoffHours: number; refundPercent: number }): number {
-  const msBefore = input.startAt.getTime() - input.now.getTime();
-  if (msBefore < input.cutoffHours * 3_600_000) return 0;
-  return Math.round((input.paidAmount * input.refundPercent) / 100);
-}
