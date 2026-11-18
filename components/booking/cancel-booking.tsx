@@ -1,0 +1,76 @@
+"use client";
+
+import { useState } from "react";
+import { useRouter } from "next/navigation";
+import { Button } from "@/components/ui/button";
+import { Alert } from "@/components/ui/field";
+import { OtpVerify } from "@/components/booking/otp-verify";
+import { api, ApiError, inr } from "@/lib/utils";
+
+/** Cancel button for the booking page. Asks for OTP first if this browser hasn't verified the owner's phone. */
+export function CancelBooking({ bookingCode, refund, paid, cutoffHours, verified }: { bookingCode: string; refund: number; paid: number; cutoffHours: number; verified: boolean }) {
+  const router = useRouter();
+  const [stage, setStage] = useState<"idle" | "otp" | "confirm" | "done">("idle");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<string | null>(null);
+
+  const cancel = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await api<{ refunded: number; refundError?: string }>(`/api/bookings/${bookingCode}/cancel`, { method: "POST" });
+      setResult(
+        r.refundError
+          ? "Booking cancelled. The refund couldn't be started automatically — our team will process it manually."
+          : r.refunded > 0
+            ? `Booking cancelled. ${inr(r.refunded)} will be refunded to your original payment method in 5–7 working days.`
+            : "Booking cancelled.",
+      );
+      setStage("done");
+      router.refresh();
+    } catch (e) {
+      if (e instanceof ApiError && (e.code === "PHONE_NOT_VERIFIED" || e.code === "FORBIDDEN")) setStage("otp");
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (stage === "done") return <Alert tone="success">{result}</Alert>;
+
+  return (
+    <div className="rounded-2xl border border-zinc-200 p-5">
+      <h2 className="font-display text-xl font-bold uppercase">Need to cancel?</h2>
+      <p className="mt-1 text-sm text-zinc-600">
+        {refund > 0
+          ? `Cancel now and get ${inr(refund)} back.`
+          : paid > 0
+            ? `Your slot starts within ${cutoffHours} hours, so the advance of ${inr(paid)} is non-refundable.`
+            : "This booking has no online payment to refund."}
+      </p>
+      {stage === "idle" && (
+        <Button variant="light" className="mt-4" onClick={() => setStage(verified ? "confirm" : "otp")}>
+          Cancel booking
+        </Button>
+      )}
+      {stage === "otp" && (
+        <div className="mt-4">
+          <p className="mb-2 text-sm font-semibold">First, confirm it&apos;s you.</p>
+          <OtpVerify target={{ bookingCode }} onVerified={() => setStage("confirm")} />
+        </div>
+      )}
+      {stage === "confirm" && (
+        <div className="mt-4 flex flex-wrap gap-3">
+          <Button variant="danger" onClick={cancel} loading={busy} data-testid="confirm-cancel">
+            Yes, cancel{refund > 0 ? ` & refund ${inr(refund)}` : ""}
+          </Button>
+          <Button variant="light" onClick={() => setStage("idle")} disabled={busy}>
+            Keep booking
+          </Button>
+        </div>
+      )}
+      {error && <Alert className="mt-4">{error}</Alert>}
+    </div>
+  );
+}

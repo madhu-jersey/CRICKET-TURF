@@ -1,0 +1,809 @@
+/**
+ * Booking write-side: holds, payment confirmation, refunds, cancellation, admin bookings, crons.
+ *
+ * Correctness model
+ * - The `no_overlap` exclusion constraint is the single source of truth for double booking.
+ *   Application checks exist only to produce nicer errors; the INSERT is what decides.
+ * - A PENDING_PAYMENT hold whose holdExpiresAt has passed is treated as free everywhere; before
+ *   inserting, stale holds overlapping the requested range are flipped to EXPIRED in the same
+ *   transaction so the constraint no longer counts them.
+ * - Only server-verified payment events (checkout signature or signed webhook) confirm bookings,
+ *   and confirmation is idempotent via a row lock on the Payment.
+ */
+import "server-only";
+import { and, eq, gt, inArray, isNull, lte, lt, sql, desc, count } from "drizzle-orm";
+import { getDb, pgErrorCode, PG_EXCLUSION_VIOLATION, PG_UNIQUE_VIOLATION, schema, type Queryable, type Tx } from "@/db/client";
+import { siteConfig } from "@/config/site";
+import { AppError, SLOT_TAKEN_MESSAGE } from "@/lib/errors";
+import { priceBreakdown, formatINR } from "@/lib/pricing";
+import { computeRefund, pickConsecutive, type Slot } from "@/lib/booking/slots";
+import { getBookingByCode, getBookingById, getSettings, loadAvailability, netPaid } from "@/lib/booking/data";
+import { getPaymentProvider, type CreatedOrder } from "@/lib/providers/payment";
+import { enqueueMessage, dispatchInBackground, dispatchMessage } from "@/lib/messaging";
+import { runInBackground } from "@/lib/background";
+import { audit } from "@/lib/audit";
+import { randomCode } from "@/lib/security";
+import { formatDate, formatTimeRange, formatTime } from "@/lib/time";
+import { env } from "@/lib/env";
+import type { Booking, BookingSource, Payment } from "@/db/schema";
+
+export const MAX_ACTIVE_HOLDS_PER_PHONE = 3;
+
+const newBookingCode = () => `${siteConfig.bookingCodePrefix}-${randomCode(6)}`;
+
+function isConstraint(err: unknown, code: string) {
+  return pgErrorCode(err) === code;
+}
+
+async function upsertCustomer(tx: Queryable, phone: string, name: string, whatsappOptIn: boolean | undefined, now: Date) {
+  const [existing] = await tx.select().from(schema.customers).where(eq(schema.customers.phone, phone)).for("update");
+  if (existing) {
+    const patch: Partial<typeof schema.customers.$inferInsert> = { name };
+    if (whatsappOptIn !== undefined && whatsappOptIn !== existing.whatsappOptIn) {
+      patch.whatsappOptIn = whatsappOptIn;
+      patch.optInAt = whatsappOptIn ? now : null;
+    }
+    const [c] = await tx.update(schema.customers).set(patch).where(eq(schema.customers.id, existing.id)).returning();
+    return c;
+  }
+  const [c] = await tx
+    .insert(schema.customers)
+    .values({ name, phone, whatsappOptIn: !!whatsappOptIn, optInAt: whatsappOptIn ? now : null, createdAt: now })
+    .onConflictDoUpdate({ target: schema.customers.phone, set: { name } })
+    .returning();
+  return c;
+}
+
+/** Flip stale (time-expired) holds overlapping [start, end) on a court to EXPIRED. */
+async function expireStaleOverlapping(tx: Tx, courtId: string, start: Date, end: Date, now: Date) {
+  await tx
+    .update(schema.bookings)
+    .set({ status: "EXPIRED", updatedAt: now })
+    .where(
+      and(
+        eq(schema.bookings.courtId, courtId),
+        eq(schema.bookings.status, "PENDING_PAYMENT"),
+        lte(schema.bookings.holdExpiresAt, now),
+        lt(schema.bookings.startAt, end),
+        gt(schema.bookings.endAt, start),
+      ),
+    );
+}
+
+function selectionError(slots: Slot[], times: string[]) {
+  const pick = pickConsecutive(slots, times);
+  if (pick.ok) return pick;
+  if (pick.error === "UNAVAILABLE") throw new AppError("SLOT_TAKEN", SLOT_TAKEN_MESSAGE);
+  if (pick.error === "NOT_CONSECUTIVE") throw new AppError("VALIDATION", "Please choose back-to-back slots.");
+  if (pick.error === "EMPTY") throw new AppError("VALIDATION", "Please choose at least one slot.");
+  throw new AppError("VALIDATION", "That slot doesn't exist for the chosen date. Please pick again.");
+}
+
+// ───────────────────────────── First-booking offer ─────────────────────────────
+
+/** A discounted booking counts as "offer used" unless its hold expired unpaid. */
+function offerConsumed(r: { status: Booking["status"]; discount: number; holdExpiresAt: Date | null }, now: Date) {
+  if (r.discount <= 0) return false;
+  if (r.status === "PENDING_PAYMENT") return !!r.holdExpiresAt && r.holdExpiresAt > now;
+  return r.status !== "EXPIRED";
+}
+
+/**
+ * A customer (mobile number) is "new" if they have never had a confirmed/played booking (online
+ * or walk-in) and haven't already used the offer. Only holds that expired unpaid give it back.
+ */
+export async function isNewCustomer(q: Queryable, customerId: string, now = new Date()): Promise<boolean> {
+  const rows = await q
+    .select({ status: schema.bookings.status, discount: schema.bookings.discountAmount, holdExpiresAt: schema.bookings.holdExpiresAt })
+    .from(schema.bookings)
+    .where(eq(schema.bookings.customerId, customerId));
+  return !rows.some((r) => r.status === "CONFIRMED" || r.status === "COMPLETED" || r.status === "NO_SHOW" || offerConsumed(r, now));
+}
+
+/** "1 phone, 1 offer": has this device already claimed the first-booking offer (with any number)? */
+export async function deviceUsedOffer(q: Queryable, deviceId: string, now = new Date()): Promise<boolean> {
+  const rows = await q
+    .select({ status: schema.bookings.status, discount: schema.bookings.discountAmount, holdExpiresAt: schema.bookings.holdExpiresAt })
+    .from(schema.bookings)
+    .where(eq(schema.bookings.offerDeviceId, deviceId));
+  return rows.some((r) => offerConsumed(r, now));
+}
+
+export type OfferStatus = { percent: number; reason: "ELIGIBLE" | "OFF" | "RETURNING_NUMBER" | "DEVICE_USED" | "NO_DEVICE" };
+
+/** The offer a verified number would get on this device (0 % with the reason when not eligible). */
+export async function offerStatus(phone: string, deviceId: string | null, now = new Date()): Promise<OfferStatus> {
+  const db = await getDb();
+  const settings = await getSettings(db);
+  if (settings.newCustomerDiscountPercent <= 0) return { percent: 0, reason: "OFF" };
+  const [c] = await db.select({ id: schema.customers.id }).from(schema.customers).where(eq(schema.customers.phone, phone));
+  if (c && !(await isNewCustomer(db, c.id, now))) return { percent: 0, reason: "RETURNING_NUMBER" };
+  if (!deviceId) return { percent: 0, reason: "NO_DEVICE" };
+  if (await deviceUsedOffer(db, deviceId, now)) return { percent: 0, reason: "DEVICE_USED" };
+  return { percent: settings.newCustomerDiscountPercent, reason: "ELIGIBLE" };
+}
+
+// ───────────────────────────── Online hold ─────────────────────────────
+
+export type HoldResponse = {
+  bookingCode: string;
+  status: Booking["status"];
+  holdExpiresAt: string | null;
+  subtotal: number;
+  discount: number;
+  total: number;
+  advance: number;
+  balance: number;
+  order: (CreatedOrder & { provider: "razorpay" | "mock"; keyId: string }) | null;
+  prefill: { name: string; phone: string };
+};
+
+export async function createOnlineHold(
+  input: { courtId: string; date: string; times: string[]; name: string; whatsappOptIn: boolean; idempotencyKey: string; phone: string; deviceId: string | null },
+  now = new Date(),
+): Promise<HoldResponse> {
+  const db = await getDb();
+
+  const [dupe] = await db.select().from(schema.bookings).where(eq(schema.bookings.idempotencyKey, input.idempotencyKey));
+  if (dupe) return holdResponseFor(dupe.bookingCode, input.phone, now);
+
+  const settings = await getSettings(db);
+  const avail = await loadAvailability(db, input.courtId, input.date, now);
+  const pick = selectionError(avail.slots, input.times);
+  const slotPrices = pick.slots.map((s) => s.price);
+  const startAt = new Date(pick.slots[0].startAt);
+  const endAt = new Date(pick.slots[pick.slots.length - 1].endAt);
+  const holdExpiresAt = new Date(now.getTime() + settings.holdMinutes * 60_000);
+
+  let booking: Booking;
+  try {
+    booking = await db.transaction(async (tx) => {
+      const customer = await upsertCustomer(tx, input.phone, input.name, input.whatsappOptIn, now);
+      const [{ n }] = await tx
+        .select({ n: count() })
+        .from(schema.bookings)
+        .where(and(eq(schema.bookings.customerId, customer.id), eq(schema.bookings.status, "PENDING_PAYMENT"), gt(schema.bookings.holdExpiresAt, now)));
+      if (n >= MAX_ACTIVE_HOLDS_PER_PHONE) {
+        throw new AppError("RATE_LIMITED", "You have too many unpaid bookings. Complete or let them expire first.");
+      }
+      await expireStaleOverlapping(tx, input.courtId, startAt, endAt, now);
+      // First-booking offer, decided inside the transaction while the customer row is locked,
+      // so two parallel holds from the same new number can't both get it.
+      // Both the number and the device must be new. The advisory lock serialises parallel holds
+      // from the same device (even with different numbers) so only one can claim the offer.
+      let discountPct = 0;
+      if (settings.newCustomerDiscountPercent > 0 && input.deviceId && (await isNewCustomer(tx, customer.id, now))) {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${"offer:" + input.deviceId}))`);
+        if (!(await deviceUsedOffer(tx, input.deviceId, now))) discountPct = settings.newCustomerDiscountPercent;
+      }
+      const price = priceBreakdown(slotPrices, settings, discountPct);
+      const noPaymentNeeded = price.advance === 0;
+      const [b] = await tx
+        .insert(schema.bookings)
+        .values({
+          bookingCode: newBookingCode(),
+          customerId: customer.id,
+          courtId: input.courtId,
+          startAt,
+          endAt,
+          status: noPaymentNeeded ? "CONFIRMED" : "PENDING_PAYMENT",
+          totalAmount: price.total,
+          advanceAmount: price.advance,
+          balanceAmount: price.balance,
+          discountAmount: price.discount,
+          offerDeviceId: price.discount > 0 ? input.deviceId : null,
+          source: "ONLINE",
+          holdExpiresAt: noPaymentNeeded ? null : holdExpiresAt,
+          idempotencyKey: input.idempotencyKey,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .returning();
+      return b;
+    });
+  } catch (e) {
+    if (isConstraint(e, PG_EXCLUSION_VIOLATION)) throw new AppError("SLOT_TAKEN", SLOT_TAKEN_MESSAGE);
+    if (isConstraint(e, PG_UNIQUE_VIOLATION)) {
+      // Same idempotency key raced in, or (astronomically unlikely) a booking-code collision.
+      const [again] = await db.select().from(schema.bookings).where(eq(schema.bookings.idempotencyKey, input.idempotencyKey));
+      if (again) return holdResponseFor(again.bookingCode, input.phone, now);
+      throw new AppError("INTERNAL", "Please try again.");
+    }
+    throw e;
+  }
+  if (booking.status === "CONFIRMED") notifyConfirmed(booking.id);
+  return holdResponseFor(booking.bookingCode, input.phone, now);
+}
+
+/** Returns the hold plus a usable payment order (reusing an open order or creating a new one). */
+export async function holdResponseFor(code: string, phone: string | null, now = new Date()): Promise<HoldResponse> {
+  const d = await getBookingByCode(code);
+  if (!d) throw new AppError("NOT_FOUND", "Booking not found.");
+  if (phone && d.customer.phone !== phone) throw new AppError("FORBIDDEN", "This booking belongs to a different phone number.");
+  const b = d.booking;
+  const base = {
+    bookingCode: b.bookingCode,
+    status: b.status,
+    holdExpiresAt: b.holdExpiresAt?.toISOString() ?? null,
+    subtotal: b.totalAmount + b.discountAmount,
+    discount: b.discountAmount,
+    total: b.totalAmount,
+    advance: b.advanceAmount,
+    balance: b.balanceAmount,
+    prefill: { name: d.customer.name, phone: d.customer.phone },
+  };
+  if (b.status !== "PENDING_PAYMENT") return { ...base, order: null };
+  if (!b.holdExpiresAt || b.holdExpiresAt.getTime() <= now.getTime()) throw new AppError("HOLD_EXPIRED", "Your slot hold expired. Please pick the slot again.");
+  const order = await ensureOrder(b, d.payments);
+  return { ...base, order };
+}
+
+async function ensureOrder(b: Booking, payments: Payment[]) {
+  const provider = getPaymentProvider();
+  const open = payments.find((p) => p.status === "CREATED" && p.provider === provider.name && p.amount === b.advanceAmount && p.providerOrderId);
+  if (open?.providerOrderId) {
+    return { orderId: open.providerOrderId, amountPaise: open.amount * 100, currency: "INR" as const, provider: provider.name, keyId: provider.keyId };
+  }
+  const order = await provider.createOrder({
+    amountRupees: b.advanceAmount,
+    receipt: b.bookingCode,
+    notes: { bookingCode: b.bookingCode },
+  });
+  const db = await getDb();
+  await db.insert(schema.payments).values({
+    bookingId: b.id,
+    provider: provider.name,
+    kind: "ADVANCE",
+    providerOrderId: order.orderId,
+    amount: b.advanceAmount,
+    status: "CREATED",
+  });
+  return { ...order, provider: provider.name, keyId: provider.keyId };
+}
+
+// ───────────────────────────── Payment confirmation ─────────────────────────────
+
+export type ConfirmOutcome = "CONFIRMED" | "CONFIRMED_LATE" | "ALREADY_PROCESSED" | "REFUND_SLOT_TAKEN" | "REFUND_NOT_BOOKABLE" | "AMOUNT_MISMATCH";
+
+/**
+ * Called from the checkout callback (after signature verification) and from the
+ * `payment.captured` webhook. Safe to call any number of times for the same order.
+ */
+export async function confirmPayment(
+  input: { orderId: string; paymentId: string; amountPaise?: number; raw?: unknown; via: "checkout" | "webhook" },
+  now = new Date(),
+): Promise<{ bookingCode: string; outcome: ConfirmOutcome }> {
+  const db = await getDb();
+  const result = await db.transaction(async (tx) => {
+    const [payment] = await tx.select().from(schema.payments).where(eq(schema.payments.providerOrderId, input.orderId)).for("update");
+    if (!payment) throw new AppError("NOT_FOUND", "Unknown payment order.");
+    const [booking] = await tx.select().from(schema.bookings).where(eq(schema.bookings.id, payment.bookingId)).for("update");
+    if (payment.status === "PAID" || payment.status === "REFUNDED") {
+      return { booking, payment, outcome: "ALREADY_PROCESSED" as ConfirmOutcome };
+    }
+    if (input.amountPaise !== undefined && input.amountPaise !== payment.amount * 100) {
+      await audit(tx, { actor: "system", action: "payment.amount_mismatch", entity: "Payment", entityId: payment.id, after: { expected: payment.amount * 100, got: input.amountPaise } });
+      return { booking, payment, outcome: "AMOUNT_MISMATCH" as ConfirmOutcome };
+    }
+    const [paid] = await tx
+      .update(schema.payments)
+      .set({ status: "PAID", providerPaymentId: input.paymentId, paidAt: now, updatedAt: now, rawWebhookPayload: (input.raw ?? null) as never })
+      .where(eq(schema.payments.id, payment.id))
+      .returning();
+
+    let outcome: ConfirmOutcome;
+    if (booking.status === "PENDING_PAYMENT") {
+      await tx.update(schema.bookings).set({ status: "CONFIRMED", holdExpiresAt: null, updatedAt: now }).where(eq(schema.bookings.id, booking.id));
+      outcome = "CONFIRMED";
+    } else if (booking.status === "EXPIRED") {
+      // Paid after the hold expired: confirm only if the slot is still free (savepoint so the
+      // exclusion violation doesn't abort the outer transaction).
+      try {
+        await tx.transaction(async (sp) => {
+          await expireStaleOverlapping(sp, booking.courtId, booking.startAt, booking.endAt, now);
+          if (booking.startAt.getTime() <= now.getTime()) throw new AppError("NOT_ALLOWED", "Slot already started");
+          const blocked = await sp
+            .select({ id: schema.blockedSlots.id })
+            .from(schema.blockedSlots)
+            .where(and(eq(schema.blockedSlots.courtId, booking.courtId), lt(schema.blockedSlots.startAt, booking.endAt), gt(schema.blockedSlots.endAt, booking.startAt)));
+          if (blocked.length) throw new AppError("NOT_ALLOWED", "Slot blocked");
+          await sp.update(schema.bookings).set({ status: "CONFIRMED", holdExpiresAt: null, updatedAt: now }).where(eq(schema.bookings.id, booking.id));
+        });
+        outcome = "CONFIRMED_LATE";
+      } catch (e) {
+        if (!isConstraint(e, PG_EXCLUSION_VIOLATION) && !(e instanceof AppError)) throw e;
+        await tx
+          .update(schema.bookings)
+          .set({ status: "CANCELLED", cancelledAt: now, cancelReason: "Payment received after the hold expired and the slot was taken — auto refund", updatedAt: now })
+          .where(eq(schema.bookings.id, booking.id));
+        outcome = "REFUND_SLOT_TAKEN";
+      }
+    } else if (booking.status === "CONFIRMED" || booking.status === "COMPLETED") {
+      // A second order for an already-paid booking (e.g. retried in another tab): refund it.
+      outcome = "REFUND_NOT_BOOKABLE";
+    } else {
+      // CANCELLED / REFUNDED / NO_SHOW: never revive — refund.
+      outcome = "REFUND_NOT_BOOKABLE";
+    }
+    await audit(tx, { actor: `system:${input.via}`, action: `payment.${outcome.toLowerCase()}`, entity: "Booking", entityId: booking.id, after: { orderId: input.orderId, paymentId: input.paymentId } });
+    return { booking, payment: paid, outcome };
+  });
+
+  const code = result.booking.bookingCode;
+  if (result.outcome === "CONFIRMED" || result.outcome === "CONFIRMED_LATE") {
+    notifyConfirmed(result.booking.id);
+  } else if (result.outcome === "REFUND_SLOT_TAKEN" || result.outcome === "REFUND_NOT_BOOKABLE") {
+    const wasLive = result.booking.status === "CONFIRMED" || result.booking.status === "COMPLETED";
+    await refundSinglePayment(result.payment, result.payment.amount, "system", now);
+    if (!wasLive) {
+      await db
+        .update(schema.bookings)
+        .set({ status: "REFUNDED", refundAmount: sql`${schema.bookings.refundAmount} + ${result.payment.amount}`, updatedAt: now })
+        .where(and(eq(schema.bookings.id, result.booking.id), eq(schema.bookings.status, "CANCELLED")));
+      notifyCancelled(result.booking.id, result.payment.amount);
+    }
+  }
+  return { bookingCode: code, outcome: result.outcome };
+}
+
+export async function markPaymentFailed(orderId: string, raw: unknown, now = new Date()) {
+  const db = await getDb();
+  const [p] = await db
+    .update(schema.payments)
+    .set({ status: "FAILED", rawWebhookPayload: (raw ?? null) as never, updatedAt: now })
+    .where(and(eq(schema.payments.providerOrderId, orderId), eq(schema.payments.status, "CREATED")))
+    .returning();
+  if (!p) return { updated: false };
+  const d = await getBookingById(p.bookingId, db);
+  if (d && d.booking.status === "PENDING_PAYMENT" && d.booking.holdExpiresAt && d.booking.holdExpiresAt > now) {
+    const minutes = Math.max(1, Math.round((d.booking.holdExpiresAt.getTime() - now.getTime()) / 60_000));
+    const id = await enqueueMessage(db, {
+      phone: d.customer.phone,
+      optedIn: d.customer.whatsappOptIn,
+      bookingId: d.booking.id,
+      template: "payment_failed_hold_expiring",
+      params: { name: d.customer.name, code: d.booking.bookingCode, minutes: String(minutes), link: `${env.siteUrl}/booking/${d.booking.bookingCode}` },
+      dedupeKey: `payment_failed:${d.booking.id}`,
+    });
+    dispatchInBackground([id]);
+  }
+  return { updated: true };
+}
+
+/** Verifies and processes a Razorpay (or mock) webhook. Idempotent per event id. */
+export async function handlePaymentWebhook(rawBody: string, signature: string | null, eventIdHeader: string | null) {
+  const provider = getPaymentProvider();
+  if (!signature || !provider.verifyWebhookSignature(rawBody, signature)) throw new AppError("INVALID_SIGNATURE", "Invalid webhook signature");
+  let body: {
+    event?: string;
+    payload?: { payment?: { entity?: { id?: string; order_id?: string; amount?: number } }; order?: { entity?: { id?: string } } };
+  };
+  try {
+    body = JSON.parse(rawBody);
+  } catch {
+    throw new AppError("VALIDATION", "Invalid JSON");
+  }
+  const event = body.event ?? "unknown";
+  const pay = body.payload?.payment?.entity;
+  const eventId = eventIdHeader || `${event}:${pay?.id ?? body.payload?.order?.entity?.id ?? "?"}`;
+  const db = await getDb();
+  const [seen] = await db.select().from(schema.webhookEvents).where(eq(schema.webhookEvents.id, eventId));
+  if (seen) return { duplicate: true, event };
+
+  let result: unknown = null;
+  if ((event === "payment.captured" || event === "order.paid") && pay?.id && pay.order_id) {
+    result = await confirmPayment({ orderId: pay.order_id, paymentId: pay.id, amountPaise: pay.amount, raw: body, via: "webhook" });
+  } else if (event === "payment.failed" && pay?.order_id) {
+    result = await markPaymentFailed(pay.order_id, body);
+  }
+  await db.insert(schema.webhookEvents).values({ id: eventId, type: event }).onConflictDoNothing();
+  return { duplicate: false, event, result };
+}
+
+// ───────────────────────────── Refunds & cancellation ─────────────────────────────
+
+async function refundSinglePayment(p: Payment, amount: number, actor: string, now: Date) {
+  if (amount <= 0) return 0;
+  const db = await getDb();
+  let refundId: string | null = null;
+  if (p.provider === "razorpay" || p.provider === "mock") {
+    const provider = getPaymentProvider();
+    if (p.provider === provider.name && p.providerPaymentId) {
+      refundId = (await provider.refund({ paymentId: p.providerPaymentId, amountRupees: amount, notes: { paymentId: p.id } })).refundId;
+    } else {
+      refundId = `manual_${p.provider}_${Date.now()}`; // demo data paid via a different provider
+    }
+  } else {
+    refundId = `manual_${p.provider.toLowerCase()}`; // cash/UPI handed back at the counter
+  }
+  const newRefund = p.refundAmount + amount;
+  await db
+    .update(schema.payments)
+    .set({ refundAmount: newRefund, providerRefundId: refundId, refundedAt: now, status: newRefund >= p.amount ? "REFUNDED" : "PAID", updatedAt: now })
+    .where(eq(schema.payments.id, p.id));
+  await audit(db, { actor, action: "payment.refund", entity: "Payment", entityId: p.id, before: { refundAmount: p.refundAmount }, after: { refundAmount: newRefund, refundId } });
+  return amount;
+}
+
+/** Refunds `amount` across a booking's paid payments (online first). Returns the amount refunded. */
+export async function refundBookingPayments(bookingId: string, amount: number, actor: string, now = new Date()) {
+  const db = await getDb();
+  const payments = await db.select().from(schema.payments).where(and(eq(schema.payments.bookingId, bookingId), inArray(schema.payments.status, ["PAID"])));
+  payments.sort((a, b) => Number(b.provider === "razorpay" || b.provider === "mock") - Number(a.provider === "razorpay" || a.provider === "mock"));
+  let left = amount;
+  let done = 0;
+  for (const p of payments) {
+    if (left <= 0) break;
+    const take = Math.min(left, p.amount - p.refundAmount);
+    if (take <= 0) continue;
+    done += await refundSinglePayment(p, take, actor, now);
+    left -= take;
+  }
+  return done;
+}
+
+export type CancelRefund = { mode: "POLICY" } | { mode: "FULL" } | { mode: "NONE" } | { mode: "PARTIAL"; amount: number };
+
+export async function previewCustomerRefund(code: string, now = new Date()) {
+  const d = await getBookingByCode(code);
+  if (!d) return null;
+  const s = await getSettings();
+  const paid = netPaid(d.payments);
+  return {
+    paid,
+    refund: computeRefund({ startAt: d.booking.startAt, now, paidAmount: paid, cutoffHours: s.cancellationCutoffHours, refundPercent: s.refundPercentBeforeCutoff }),
+    cutoffHours: s.cancellationCutoffHours,
+  };
+}
+
+export async function cancelBooking(
+  input: { bookingId: string; actor: string; by: "CUSTOMER" | "ADMIN"; refund: CancelRefund; reason?: string },
+  now = new Date(),
+): Promise<{ status: Booking["status"]; refunded: number; refundError?: string }> {
+  const db = await getDb();
+  const settings = await getSettings(db);
+  const { booking, refundDue } = await db.transaction(async (tx) => {
+    const [b] = await tx.select().from(schema.bookings).where(eq(schema.bookings.id, input.bookingId)).for("update");
+    if (!b) throw new AppError("NOT_FOUND", "Booking not found.");
+    if (b.status !== "CONFIRMED" && b.status !== "PENDING_PAYMENT") throw new AppError("NOT_ALLOWED", `A ${b.status.toLowerCase().replace("_", " ")} booking can't be cancelled.`);
+    if (input.by === "CUSTOMER" && b.startAt.getTime() <= now.getTime()) throw new AppError("NOT_ALLOWED", "This slot has already started and can't be cancelled online.");
+    const payments = await tx.select().from(schema.payments).where(eq(schema.payments.bookingId, b.id));
+    const paid = netPaid(payments);
+    let due = 0;
+    switch (input.refund.mode) {
+      case "POLICY":
+        due = computeRefund({ startAt: b.startAt, now, paidAmount: paid, cutoffHours: settings.cancellationCutoffHours, refundPercent: settings.refundPercentBeforeCutoff });
+        break;
+      case "FULL":
+        due = paid;
+        break;
+      case "PARTIAL":
+        if (input.refund.amount < 0 || input.refund.amount > paid) throw new AppError("VALIDATION", `Refund must be between ₹0 and ${formatINR(paid)}.`);
+        due = input.refund.amount;
+        break;
+      case "NONE":
+        due = 0;
+    }
+    const [updated] = await tx
+      .update(schema.bookings)
+      .set({ status: "CANCELLED", cancelledAt: now, cancelReason: input.reason?.slice(0, 300) || (input.by === "CUSTOMER" ? "Cancelled by customer" : "Cancelled by venue"), holdExpiresAt: null, updatedAt: now })
+      .where(eq(schema.bookings.id, b.id))
+      .returning();
+    await audit(tx, { actor: input.actor, action: "booking.cancel", entity: "Booking", entityId: b.id, before: { status: b.status }, after: { status: "CANCELLED", refundDue: due, mode: input.refund.mode } });
+    return { booking: updated, refundDue: due };
+  });
+
+  let refunded = 0;
+  let refundError: string | undefined;
+  if (refundDue > 0) {
+    try {
+      refunded = await refundBookingPayments(booking.id, refundDue, input.actor, now);
+      await db.update(schema.bookings).set({ status: "REFUNDED", refundAmount: booking.refundAmount + refunded, updatedAt: now }).where(eq(schema.bookings.id, booking.id));
+    } catch (e) {
+      refundError = e instanceof Error ? e.message : String(e);
+      await audit(db, { actor: input.actor, action: "booking.refund_failed", entity: "Booking", entityId: booking.id, after: { refundDue, error: refundError } });
+    }
+  }
+  if (booking.advanceAmount > 0 || booking.source !== "ONLINE" || refunded > 0) notifyCancelled(booking.id, refunded);
+  return { status: refunded > 0 ? "REFUNDED" : "CANCELLED", refunded, refundError };
+}
+
+/** Admin refund for a booking that is already cancelled/expired but still holds money (e.g. a failed auto-refund). */
+export async function refundCancelledBooking(bookingId: string, amount: number, actor: string, now = new Date()) {
+  const d = await getBookingById(bookingId);
+  if (!d) throw new AppError("NOT_FOUND", "Booking not found.");
+  if (!["CANCELLED", "EXPIRED", "REFUNDED", "NO_SHOW"].includes(d.booking.status)) throw new AppError("NOT_ALLOWED", "Cancel the booking first.");
+  const paid = netPaid(d.payments);
+  if (amount <= 0 || amount > paid) throw new AppError("VALIDATION", `Refund must be between ₹1 and ${formatINR(paid)}.`);
+  const refunded = await refundBookingPayments(bookingId, amount, actor, now);
+  const db = await getDb();
+  await db.update(schema.bookings).set({ status: d.booking.status === "NO_SHOW" ? "NO_SHOW" : "REFUNDED", refundAmount: d.booking.refundAmount + refunded, updatedAt: now }).where(eq(schema.bookings.id, bookingId));
+  notifyCancelled(bookingId, refunded, `refund:${bookingId}:${now.getTime()}`);
+  return refunded;
+}
+
+// ───────────────────────────── Admin bookings ─────────────────────────────
+
+export async function createAdminBooking(
+  input: {
+    courtId: string;
+    date: string;
+    times: string[];
+    name: string;
+    phone: string;
+    whatsappOptIn: boolean;
+    source: Exclude<BookingSource, "ONLINE">;
+    amountReceived: number;
+    paymentMode: "CASH" | "UPI" | "CARD";
+    notes?: string;
+  },
+  actor: string,
+  now = new Date(),
+) {
+  const db = await getDb();
+  const avail = await loadAvailability(db, input.courtId, input.date, now, { admin: true });
+  const pick = selectionError(avail.slots, input.times);
+  const total = pick.slots.reduce((s, x) => s + x.price, 0);
+  if (input.amountReceived > total) throw new AppError("VALIDATION", `Amount received can't exceed the total of ${formatINR(total)}.`);
+  const startAt = new Date(pick.slots[0].startAt);
+  const endAt = new Date(pick.slots[pick.slots.length - 1].endAt);
+  try {
+    const booking = await db.transaction(async (tx) => {
+      const customer = await upsertCustomer(tx, input.phone, input.name, input.whatsappOptIn || undefined, now);
+      await expireStaleOverlapping(tx, input.courtId, startAt, endAt, now);
+      const [b] = await tx
+        .insert(schema.bookings)
+        .values({
+          bookingCode: newBookingCode(),
+          customerId: customer.id,
+          courtId: input.courtId,
+          startAt,
+          endAt,
+          status: "CONFIRMED",
+          totalAmount: total,
+          advanceAmount: input.amountReceived,
+          balanceAmount: total - input.amountReceived,
+          balancePaidAt: input.amountReceived === total ? now : null,
+          source: input.source,
+          notes: input.notes || null,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .returning();
+      if (input.amountReceived > 0) {
+        await tx.insert(schema.payments).values({ bookingId: b.id, provider: input.paymentMode, kind: "ADVANCE", amount: input.amountReceived, status: "PAID", paidAt: now });
+      }
+      await audit(tx, { actor, action: "booking.create_admin", entity: "Booking", entityId: b.id, after: { code: b.bookingCode, source: b.source, total, received: input.amountReceived } });
+      return b;
+    });
+    notifyConfirmed(booking.id);
+    return booking;
+  } catch (e) {
+    if (isConstraint(e, PG_EXCLUSION_VIOLATION)) throw new AppError("SLOT_TAKEN", "That slot overlaps an existing booking.");
+    throw e;
+  }
+}
+
+export async function markBalancePaid(bookingId: string, mode: "CASH" | "UPI" | "CARD", actor: string, now = new Date()) {
+  const db = await getDb();
+  return db.transaction(async (tx) => {
+    const [b] = await tx.select().from(schema.bookings).where(eq(schema.bookings.id, bookingId)).for("update");
+    if (!b) throw new AppError("NOT_FOUND", "Booking not found.");
+    if (!["CONFIRMED", "COMPLETED"].includes(b.status)) throw new AppError("NOT_ALLOWED", "Only confirmed or completed bookings can take a balance payment.");
+    if (b.balancePaidAt || b.balanceAmount === 0) throw new AppError("NOT_ALLOWED", "The balance is already settled.");
+    await tx.insert(schema.payments).values({ bookingId: b.id, provider: mode, kind: "BALANCE", amount: b.balanceAmount, status: "PAID", paidAt: now });
+    await tx.update(schema.bookings).set({ balancePaidAt: now, updatedAt: now }).where(eq(schema.bookings.id, b.id));
+    await audit(tx, { actor, action: "booking.balance_paid", entity: "Booking", entityId: b.id, after: { amount: b.balanceAmount, mode } });
+  });
+}
+
+export async function setBookingOutcome(bookingId: string, outcome: "COMPLETED" | "NO_SHOW", actor: string, now = new Date()) {
+  const db = await getDb();
+  return db.transaction(async (tx) => {
+    const [b] = await tx.select().from(schema.bookings).where(eq(schema.bookings.id, bookingId)).for("update");
+    if (!b) throw new AppError("NOT_FOUND", "Booking not found.");
+    if (!["CONFIRMED", "COMPLETED", "NO_SHOW"].includes(b.status)) throw new AppError("NOT_ALLOWED", "Only confirmed bookings can be marked completed or no-show.");
+    if (b.startAt.getTime() > now.getTime()) throw new AppError("NOT_ALLOWED", "You can mark this after the slot starts.");
+    await tx.update(schema.bookings).set({ status: outcome, updatedAt: now }).where(eq(schema.bookings.id, b.id));
+    await audit(tx, { actor, action: `booking.${outcome.toLowerCase()}`, entity: "Booking", entityId: b.id, before: { status: b.status }, after: { status: outcome } });
+  });
+}
+
+// ───────────────────────────── Blocks ─────────────────────────────
+
+export async function createBlocks(
+  input: { courtId: string; ranges: { startAt: Date; endAt: Date }[]; reason: "MAINTENANCE" | "TOURNAMENT" | "PRIVATE_EVENT" | "OTHER"; note?: string; recurrenceGroupId?: string },
+  actor: string,
+  now = new Date(),
+) {
+  const db = await getDb();
+  return db.transaction(async (tx) => {
+    const conflicts: string[] = [];
+    for (const r of input.ranges) {
+      if (r.endAt <= r.startAt) throw new AppError("VALIDATION", "End time must be after start time.");
+      const hits = await tx
+        .select({ code: schema.bookings.bookingCode })
+        .from(schema.bookings)
+        .where(
+          and(
+            eq(schema.bookings.courtId, input.courtId),
+            lt(schema.bookings.startAt, r.endAt),
+            gt(schema.bookings.endAt, r.startAt),
+            sql`(${schema.bookings.status} = 'CONFIRMED' OR (${schema.bookings.status} = 'PENDING_PAYMENT' AND ${schema.bookings.holdExpiresAt} > ${now}))`,
+          ),
+        );
+      conflicts.push(...hits.map((h) => h.code));
+    }
+    if (conflicts.length) throw new AppError("NOT_ALLOWED", `Can't block: overlaps booking${conflicts.length > 1 ? "s" : ""} ${[...new Set(conflicts)].join(", ")}. Cancel ${conflicts.length > 1 ? "them" : "it"} first.`);
+    const rows = await tx
+      .insert(schema.blockedSlots)
+      .values(input.ranges.map((r) => ({ courtId: input.courtId, startAt: r.startAt, endAt: r.endAt, reason: input.reason, note: input.note || null, recurrenceGroupId: input.recurrenceGroupId ?? null, createdBy: actor })))
+      .returning();
+    await audit(tx, { actor, action: "block.create", entity: "BlockedSlot", entityId: rows[0]?.id, after: { courtId: input.courtId, count: rows.length, reason: input.reason, recurrenceGroupId: input.recurrenceGroupId ?? null } });
+    return rows;
+  });
+}
+
+// ───────────────────────────── Crons ─────────────────────────────
+
+export async function expireHolds(now = new Date()) {
+  const db = await getDb();
+  const rows = await db
+    .update(schema.bookings)
+    .set({ status: "EXPIRED", updatedAt: now })
+    .where(and(eq(schema.bookings.status, "PENDING_PAYMENT"), lte(schema.bookings.holdExpiresAt, now)))
+    .returning({ id: schema.bookings.id });
+  return rows.length;
+}
+
+export async function sendReminders(now = new Date()) {
+  const db = await getDb();
+  const due = await db
+    .update(schema.bookings)
+    .set({ reminderSentAt: now })
+    .where(
+      and(
+        eq(schema.bookings.status, "CONFIRMED"),
+        isNull(schema.bookings.reminderSentAt),
+        gt(schema.bookings.startAt, now),
+        lte(schema.bookings.startAt, new Date(now.getTime() + 2 * 3_600_000)),
+      ),
+    )
+    .returning({ id: schema.bookings.id });
+  const ids: (string | null)[] = [];
+  for (const { id } of due) {
+    const d = await getBookingById(id, db);
+    if (!d) continue;
+    ids.push(
+      await enqueueMessage(db, {
+        phone: d.customer.phone,
+        optedIn: d.customer.whatsappOptIn,
+        bookingId: id,
+        template: "booking_reminder",
+        params: {
+          name: d.customer.name,
+          sport: siteConfig.sports[d.sport].label,
+          court: d.courtName,
+          time: formatTime(d.booking.startAt),
+          code: d.booking.bookingCode,
+          map: siteConfig.directionsUrl,
+        },
+        dedupeKey: `booking_reminder:${id}`,
+      }),
+    );
+  }
+  dispatchInBackground(ids);
+  return due.length;
+}
+
+// ───────────────────────────── Notifications ─────────────────────────────
+
+/** Queue confirmation (customer, if opted in) + owner alert. Never throws. */
+export function notifyConfirmed(bookingId: string, opts: { resend?: boolean } = {}) {
+  runInBackground(async () => {
+    try {
+      const db = await getDb();
+      const d = await getBookingById(bookingId, db);
+      if (!d) return;
+      const settings = await getSettings(db);
+      const b = d.booking;
+      const when = formatTimeRange(b.startAt, b.endAt);
+      const suffix = opts.resend ? `:resend:${Date.now()}` : "";
+      const ids = [
+        await enqueueMessage(db, {
+          phone: d.customer.phone,
+          optedIn: d.customer.whatsappOptIn,
+          bookingId,
+          template: "booking_confirmed",
+          params: {
+            name: d.customer.name,
+            sport: siteConfig.sports[d.sport].label,
+            court: d.courtName,
+            date: formatDate(b.startAt),
+            time: when,
+            code: b.bookingCode,
+            advance: formatINR(netPaid(d.payments)),
+            balance: formatINR(b.balancePaidAt ? 0 : b.balanceAmount),
+            map: siteConfig.directionsUrl,
+          },
+          dedupeKey: `booking_confirmed:${bookingId}${suffix}`,
+        }),
+      ];
+      if (!opts.resend && settings.ownerAlertPhone) {
+        ids.push(
+          await enqueueMessage(db, {
+            phone: settings.ownerAlertPhone,
+            optedIn: true,
+            bookingId,
+            template: "admin_new_booking",
+            params: {
+              code: b.bookingCode,
+              name: d.customer.name,
+              phone: d.customer.phone,
+              court: d.courtName,
+              date: formatDate(b.startAt),
+              time: when,
+              amount: formatINR(netPaid(d.payments)),
+              source: b.source,
+            },
+            dedupeKey: `admin_new_booking:${bookingId}`,
+          }),
+        );
+      }
+      for (const id of ids) if (id) await dispatchMessage(id);
+    } catch (e) {
+      console.error("[notify] confirmed failed", e);
+    }
+  });
+}
+
+export function notifyCancelled(bookingId: string, refund: number, dedupe?: string) {
+  runInBackground(async () => {
+    try {
+      const db = await getDb();
+      const d = await getBookingById(bookingId, db);
+      if (!d) return;
+      const id = await enqueueMessage(db, {
+        phone: d.customer.phone,
+        optedIn: d.customer.whatsappOptIn,
+        bookingId,
+        template: "booking_cancelled",
+        params: {
+          name: d.customer.name,
+          code: d.booking.bookingCode,
+          date: formatDate(d.booking.startAt),
+          time: formatTimeRange(d.booking.startAt, d.booking.endAt),
+          refund: refund > 0 ? formatINR(refund) : "No refund (within cancellation window)",
+        },
+        dedupeKey: dedupe ?? `booking_cancelled:${bookingId}`,
+      });
+      if (id) await dispatchMessage(id);
+    } catch (e) {
+      console.error("[notify] cancelled failed", e);
+    }
+  });
+}
+
+/** Bookings for a verified phone, newest first. */
+export async function bookingsForPhone(phone: string) {
+  const db = await getDb();
+  return db
+    .select({
+      bookingCode: schema.bookings.bookingCode,
+      startAt: schema.bookings.startAt,
+      endAt: schema.bookings.endAt,
+      status: schema.bookings.status,
+      totalAmount: schema.bookings.totalAmount,
+      advanceAmount: schema.bookings.advanceAmount,
+      courtName: schema.courts.name,
+      sport: schema.sports.name,
+    })
+    .from(schema.bookings)
+    .innerJoin(schema.customers, eq(schema.bookings.customerId, schema.customers.id))
+    .innerJoin(schema.courts, eq(schema.bookings.courtId, schema.courts.id))
+    .innerJoin(schema.sports, eq(schema.courts.sportId, schema.sports.id))
+    .where(and(eq(schema.customers.phone, phone), inArray(schema.bookings.status, ["PENDING_PAYMENT", "CONFIRMED", "COMPLETED", "CANCELLED", "REFUNDED", "NO_SHOW", "EXPIRED"])))
+    .orderBy(desc(schema.bookings.startAt))
+    .limit(100);
+}
+
