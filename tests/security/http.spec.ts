@@ -383,3 +383,36 @@ test("SEC-41 recovery codes: shown at first 2FA login, work once, regenerate rep
   expect((await c.post("/api/admin/login/verify", { data: { challengeId: step2.challengeId, recoveryCode: fresh[0] } })).status()).toBe(200);
   await Promise.all([a.dispose(), b.dispose(), c.dispose()]);
 });
+
+test("SEC-44 a gallery upload (database storage) is served back as a clean WebP, and gone after delete", async () => {
+  const { default: sharp } = await import("sharp");
+  const owner = await adminCtx("owner@demo.com");
+  const csrf = await csrfOf(owner);
+  const jpg = await sharp({ create: { width: 400, height: 300, channels: 3, background: "#0b1f14" } }).jpeg().withMetadata({ exif: { IFD0: { Copyright: "secret-location" } } }).toBuffer();
+  const up = await owner.post("/api/admin/gallery", {
+    multipart: { file: { name: "night.jpg", mimeType: "image/jpeg", buffer: jpg }, category: "FACILITIES", alt: "Floodlights at night" },
+    headers: { "x-csrf-token": csrf },
+  });
+  expect(up.status()).toBe(201);
+  const img = await up.json();
+  expect(img.url).toMatch(/^\/api\/files\//);
+
+  const anon = await pwRequest.newContext({ baseURL: BASE });
+  const file = await anon.get(img.url);
+  expect(file.status()).toBe(200);
+  expect(file.headers()["content-type"]).toBe("image/webp");
+  const bytes = await file.body();
+  expect(bytes.subarray(8, 12).toString()).toBe("WEBP");
+  expect(bytes.includes(Buffer.from("secret-location"))).toBe(false); // metadata stripped
+  // The public gallery page links to it.
+  expect(await (await anon.get("/gallery")).text()).toContain(img.url.replace(/\//g, "%2F"));
+
+  // …and the Next.js image optimiser (what the page actually loads) can fetch and resize it.
+  const optimised = await anon.get(`/_next/image?url=${encodeURIComponent(img.url)}&w=640&q=75`);
+  expect(optimised.status()).toBe(200);
+  expect(optimised.headers()["content-type"]).toMatch(/^image\//);
+
+  expect((await owner.delete(`/api/admin/gallery?id=${img.id}`, { headers: { "x-csrf-token": csrf } })).status()).toBe(200);
+  expect((await anon.get(img.url)).status()).toBe(404);
+  await anon.dispose();
+});

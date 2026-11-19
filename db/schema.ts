@@ -97,6 +97,8 @@ export const bookings = pgTable("Booking", {
   balanceAmount: integer("balanceAmount").notNull(),
   balancePaidAt: ts("balancePaidAt"),
   refundAmount: integer("refundAmount").notNull().default(0),
+  /** Refund still owed after a failed refund call; retried by the cron. [SEC-45] */
+  refundPendingAmount: integer("refundPendingAmount").notNull().default(0),
   discountAmount: integer("discountAmount").notNull().default(0),
   offerDeviceId: text("offerDeviceId"),
   source: text("source").$type<BookingSource>().notNull(),

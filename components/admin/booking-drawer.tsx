@@ -9,7 +9,7 @@ import { StatusBadge } from "@/components/admin/shell";
 import { inr } from "@/lib/utils";
 
 type Detail = {
-  booking: { id: string; bookingCode: string; startAt: string; endAt: string; status: string; totalAmount: number; discountAmount: number; advanceAmount: number; balanceAmount: number; balancePaidAt: string | null; refundAmount: number; source: string; cancelReason: string | null; notes: string | null; createdAt: string };
+  booking: { id: string; bookingCode: string; startAt: string; endAt: string; status: string; totalAmount: number; discountAmount: number; advanceAmount: number; balanceAmount: number; balancePaidAt: string | null; refundAmount: number; refundPendingAmount: number; source: string; cancelReason: string | null; notes: string | null; createdAt: string };
   customer: { name: string; phone: string; whatsappOptIn: boolean };
   courtName: string;
   sport: string;
@@ -66,7 +66,7 @@ export function BookingDrawer({ id, onClose, role }: { id: string | null; onClos
     setMsg(null);
     try {
       const r = await adminApi<{ refunded?: number; refundError?: string }>(`/api/admin/bookings/${id}`, { method: "POST", json: { action, ...extra } });
-      setMsg(r.refundError ? `Cancelled, but refund failed: ${r.refundError}` : r.refunded ? `${done}. Refunded ${inr(r.refunded)}.` : done);
+      setMsg(r.refundError ? `Cancelled, but the refund failed (${r.refundError}). It will be retried automatically every 15 minutes.` : r.refunded ? `${done}. Refunded ${inr(r.refunded)}.` : done);
       setCancelOpen(false);
       await load();
       router.refresh();
@@ -109,6 +109,9 @@ export function BookingDrawer({ id, onClose, role }: { id: string | null; onClos
               <div><dt className="text-zinc-500">Collected (net)</dt><dd className="font-semibold">{inr(d.paid)}</dd></div>
               <div><dt className="text-zinc-500">Balance</dt><dd className="font-semibold">{b.balancePaidAt ? "Paid" : inr(b.balanceAmount)}</dd></div>
               <div><dt className="text-zinc-500">Refunded</dt><dd className="font-semibold">{inr(b.refundAmount)}</dd></div>
+              {b.refundPendingAmount > 0 && (
+                <div className="col-span-2" data-testid="refund-pending"><dt className="text-zinc-500">Refund pending</dt><dd className="font-semibold text-amber-700">{inr(b.refundPendingAmount)} — the payment provider refused it; retried automatically every 15 minutes</dd></div>
+              )}
               {b.cancelReason && <div className="col-span-2"><dt className="text-zinc-500">Cancel reason</dt><dd>{b.cancelReason}</dd></div>}
               {b.notes && <div className="col-span-2"><dt className="text-zinc-500">Notes</dt><dd>{b.notes}</dd></div>}
             </dl>

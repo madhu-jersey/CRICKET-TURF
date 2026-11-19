@@ -12,7 +12,7 @@ import { AppError } from "@/lib/errors";
 import { audit } from "@/lib/audit";
 import { generateOtpCode } from "@/lib/otp";
 import { hmacHex, safeEqual } from "@/lib/security";
-import { getOtpProvider, SmsOtp } from "@/lib/providers/otp";
+import { deliverOtpCode } from "@/lib/providers/otp";
 import { alertOwner } from "@/lib/alerts";
 import { maskPhone } from "@/lib/auth/phone";
 import { passwordProblem } from "@/lib/auth/passwords";
@@ -36,16 +36,9 @@ export function admin2faRequired() {
 
 const codeHash = (adminId: string, purpose: CodePurpose, code: string) => hmacHex(env.appSecret, `admin:${purpose}:${adminId}:${code}`);
 
-/** Sends a code over the configured OTP channel (WhatsApp), falling back to SMS if that fails. Not counted against customer caps. */
+/** Sends a code over the configured OTP channel, falling back to SMS if that fails (SEC-46). Not counted against customer caps. */
 async function deliverCode(phone: string, code: string): Promise<{ devCode?: string }> {
-  try {
-    return await getOtpProvider().send(phone, code);
-  } catch (e) {
-    const key = env.str("MSG91_AUTH_KEY");
-    const tpl = env.str("MSG91_OTP_TEMPLATE_ID");
-    if (!key || !tpl) throw e;
-    return new SmsOtp(key, tpl).send(phone, code);
-  }
+  return deliverOtpCode(phone, code);
 }
 
 /** Creates (and sends) a code for an admin. Older unused codes of the same purpose stop working. */

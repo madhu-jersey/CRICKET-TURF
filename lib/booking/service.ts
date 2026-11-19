@@ -11,7 +11,7 @@
  *   and confirmation is idempotent via a row lock on the Payment.
  */
 import "server-only";
-import { and, eq, gt, inArray, isNull, lte, lt, sql, desc, count } from "drizzle-orm";
+import { and, eq, gt, inArray, isNull, lte, lt, or, sql, desc, count } from "drizzle-orm";
 import { getDb, pgErrorCode, PG_EXCLUSION_VIOLATION, PG_UNIQUE_VIOLATION, schema, transactionWithRetry, type Queryable, type Tx } from "@/db/client";
 import { siteConfig } from "@/config/site";
 import { AppError, SLOT_TAKEN_MESSAGE } from "@/lib/errors";
@@ -24,6 +24,7 @@ import { enqueueMessage, dispatchInBackground, dispatchMessage } from "@/lib/mes
 import { runInBackground } from "@/lib/background";
 import { invalidateAvailability } from "@/lib/booking/availability-cache";
 import { audit } from "@/lib/audit";
+import { alertOwner } from "@/lib/alerts";
 import { randomCode } from "@/lib/security";
 import { formatDate, formatTimeRange, formatTime, istDateKey } from "@/lib/time";
 import { env } from "@/lib/env";
@@ -113,6 +114,20 @@ async function expireStaleOverlapping(tx: Tx, courtId: string, start: Date, end:
         gt(schema.bookings.endAt, start),
       ),
     );
+}
+
+/**
+ * Re-checks blocks inside the booking transaction, after the court-day lock. The slot grid was read
+ * before the transaction, so a block created in between would otherwise be missed (blocks are not
+ * part of the exclusion constraint). createBlocks() takes the same lock, so the two serialise. [SEC-47]
+ */
+async function assertNotBlocked(tx: Tx, courtId: string, start: Date, end: Date) {
+  const [hit] = await tx
+    .select({ id: schema.blockedSlots.id })
+    .from(schema.blockedSlots)
+    .where(and(eq(schema.blockedSlots.courtId, courtId), lt(schema.blockedSlots.startAt, end), gt(schema.blockedSlots.endAt, start)))
+    .limit(1);
+  if (hit) throw new AppError("SLOT_TAKEN", SLOT_TAKEN_MESSAGE);
 }
 
 function selectionError(slots: Slot[], times: string[]) {
@@ -206,6 +221,7 @@ export async function createOnlineHold(
       const customer = await upsertCustomer(tx, input.phone, input.name, input.whatsappOptIn, now);
       await enforceBookingLimits(tx, customer, settings, now);
       await lockCourtDay(tx, input.courtId, input.date);
+      await assertNotBlocked(tx, input.courtId, startAt, endAt);
       await expireStaleOverlapping(tx, input.courtId, startAt, endAt, now);
       // First-booking offer, decided inside the transaction while the customer row is locked,
       // so two parallel holds from the same new number can't both get it.
@@ -378,7 +394,15 @@ export async function confirmPayment(
     notifyConfirmed(result.booking.id);
   } else if (result.outcome === "REFUND_SLOT_TAKEN" || result.outcome === "REFUND_NOT_BOOKABLE") {
     const wasLive = result.booking.status === "CONFIRMED" || result.booking.status === "COMPLETED";
-    await refundSinglePayment(result.payment, result.payment.amount, "system", now);
+    // The payment is already recorded as PAID, so a webhook retry would see ALREADY_PROCESSED and never
+    // refund. A failed refund call is therefore recorded as pending (retried by the cron, owner
+    // alerted) instead of being thrown away with a 500. [SEC-45]
+    try {
+      await refundSinglePayment(result.payment, result.payment.amount, "system", now);
+    } catch (e) {
+      await recordPendingRefund(result.booking.id, result.payment.amount, "system", e, now);
+      return { bookingCode: code, outcome: result.outcome };
+    }
     if (!wasLive) {
       await db
         .update(schema.bookings)
@@ -451,31 +475,53 @@ export async function handlePaymentWebhook(rawBody: string, signature: string | 
 
 // ───────────────────────────── Refunds & cancellation ─────────────────────────────
 
+const refundStatus = (refunded: unknown) => sql`case when ${refunded} >= ${schema.payments.amount} then 'REFUNDED' else 'PAID' end`;
+
+/**
+ * Refunds `amount` of one payment. The amount is reserved on the Payment row first (an atomic
+ * `refundAmount + amount <= amount` update), so two refunds running at once — e.g. the cron retry
+ * and an owner's manual refund — can never give back more than was paid. If the provider call
+ * fails, the reservation is released and the error is thrown. [SEC-45]
+ */
 async function refundSinglePayment(p: Payment, amount: number, actor: string, now: Date) {
   if (amount <= 0) return 0;
   const db = await getDb();
-  let refundId: string | null = null;
-  if (p.provider === "razorpay" || p.provider === "mock") {
-    const provider = getPaymentProvider();
-    if (p.provider === provider.name && p.providerPaymentId) {
-      refundId = (await provider.refund({ paymentId: p.providerPaymentId, amountRupees: amount, notes: { paymentId: p.id } })).refundId;
-    } else {
-      refundId = `manual_${p.provider}_${Date.now()}`; // demo data paid via a different provider
-    }
-  } else {
-    refundId = `manual_${p.provider.toLowerCase()}`; // cash/UPI handed back at the counter
-  }
-  const newRefund = p.refundAmount + amount;
-  await db
+  const [claimed] = await db
     .update(schema.payments)
-    .set({ refundAmount: newRefund, providerRefundId: refundId, refundedAt: now, status: newRefund >= p.amount ? "REFUNDED" : "PAID", updatedAt: now })
-    .where(eq(schema.payments.id, p.id));
-  await audit(db, { actor, action: "payment.refund", entity: "Payment", entityId: p.id, before: { refundAmount: p.refundAmount }, after: { refundAmount: newRefund, refundId } });
+    .set({ refundAmount: sql`${schema.payments.refundAmount} + ${amount}`, status: refundStatus(sql`${schema.payments.refundAmount} + ${amount}`) as never, updatedAt: now })
+    .where(and(eq(schema.payments.id, p.id), sql`${schema.payments.refundAmount} + ${amount} <= ${schema.payments.amount}`))
+    .returning({ refundAmount: schema.payments.refundAmount });
+  if (!claimed) throw new AppError("NOT_ALLOWED", "This payment has already been refunded.");
+  let refundId: string;
+  try {
+    if (p.provider === "razorpay" || p.provider === "mock") {
+      const provider = getPaymentProvider();
+      if (p.provider === provider.name && p.providerPaymentId) {
+        refundId = (await provider.refund({ paymentId: p.providerPaymentId, amountRupees: amount, notes: { paymentId: p.id } })).refundId;
+      } else {
+        refundId = `manual_${p.provider}_${Date.now()}`; // demo data paid via a different provider
+      }
+    } else {
+      refundId = `manual_${p.provider.toLowerCase()}`; // cash/UPI handed back at the counter
+    }
+  } catch (e) {
+    await db
+      .update(schema.payments)
+      .set({ refundAmount: sql`${schema.payments.refundAmount} - ${amount}`, status: refundStatus(sql`${schema.payments.refundAmount} - ${amount}`) as never, updatedAt: new Date() })
+      .where(eq(schema.payments.id, p.id));
+    throw e;
+  }
+  await db.update(schema.payments).set({ providerRefundId: refundId, refundedAt: now }).where(eq(schema.payments.id, p.id));
+  await audit(db, { actor, action: "payment.refund", entity: "Payment", entityId: p.id, before: { refundAmount: claimed.refundAmount - amount }, after: { refundAmount: claimed.refundAmount, refundId } });
   return amount;
 }
 
-/** Refunds `amount` across a booking's paid payments (online first). Returns the amount refunded. */
-export async function refundBookingPayments(bookingId: string, amount: number, actor: string, now = new Date()) {
+/**
+ * Refunds up to `amount` across a booking's paid payments (online first). Never throws for a
+ * provider failure: returns what was refunded and the first error, so callers can record the rest
+ * as pending.
+ */
+async function tryRefundBooking(bookingId: string, amount: number, actor: string, now: Date): Promise<{ done: number; error?: string }> {
   const db = await getDb();
   const payments = await db.select().from(schema.payments).where(and(eq(schema.payments.bookingId, bookingId), inArray(schema.payments.status, ["PAID"])));
   payments.sort((a, b) => Number(b.provider === "razorpay" || b.provider === "mock") - Number(a.provider === "razorpay" || a.provider === "mock"));
@@ -485,10 +531,85 @@ export async function refundBookingPayments(bookingId: string, amount: number, a
     if (left <= 0) break;
     const take = Math.min(left, p.amount - p.refundAmount);
     if (take <= 0) continue;
-    done += await refundSinglePayment(p, take, actor, now);
-    left -= take;
+    try {
+      done += await refundSinglePayment(p, take, actor, now);
+      left -= take;
+    } catch (e) {
+      if (e instanceof AppError && e.code === "NOT_ALLOWED") continue; // refunded meanwhile by someone else
+      return { done, error: e instanceof Error ? e.message : String(e) };
+    }
   }
-  return done;
+  return { done };
+}
+
+/** Refunds `amount` across a booking's paid payments (online first). Returns the amount refunded; throws on a provider failure. */
+export async function refundBookingPayments(bookingId: string, amount: number, actor: string, now = new Date()) {
+  const r = await tryRefundBooking(bookingId, amount, actor, now);
+  if (r.error) throw new AppError("PROVIDER_ERROR", r.error);
+  return r.done;
+}
+
+/**
+ * A refund call failed: remember the money still owed on the booking so the cron retries it, audit
+ * it, and tell the owner (one WhatsApp per booking per day). [SEC-45]
+ */
+async function recordPendingRefund(bookingId: string, amount: number, actor: string, err: unknown, now: Date) {
+  if (amount <= 0) return;
+  const db = await getDb();
+  const error = (err instanceof Error ? err.message : String(err)).slice(0, 300);
+  const [b] = await db
+    .update(schema.bookings)
+    .set({ refundPendingAmount: sql`${schema.bookings.refundPendingAmount} + ${amount}`, updatedAt: now })
+    .where(eq(schema.bookings.id, bookingId))
+    .returning({ code: schema.bookings.bookingCode });
+  await audit(db, { actor, action: "booking.refund_failed", entity: "Booking", entityId: bookingId, after: { amount, error } });
+  console.warn(`[refund] ${formatINR(amount)} for ${b?.code ?? bookingId} failed: ${error}`);
+  void alertOwner(`refund_failed_${bookingId}`, `Refund of ${formatINR(amount)} for booking ${b?.code ?? ""} failed. It is retried automatically every 15 minutes; check the payment dashboard if this repeats.`, now);
+}
+
+/**
+ * Cron: retry pending refunds. Each booking's pending amount is claimed with a compare-and-set
+ * (set to 0 only if unchanged), so overlapping cron runs can't both refund it. Whatever still fails
+ * is put back. On success the booking becomes REFUNDED (if cancelled/expired) and the customer is told.
+ */
+export async function retryPendingRefunds(now = new Date()) {
+  const db = await getDb();
+  const due = await db
+    .select({ id: schema.bookings.id, pending: schema.bookings.refundPendingAmount })
+    .from(schema.bookings)
+    .where(gt(schema.bookings.refundPendingAmount, 0))
+    .limit(20);
+  let refunded = 0;
+  for (const row of due) {
+    const [claimed] = await db
+      .update(schema.bookings)
+      .set({ refundPendingAmount: 0, updatedAt: now })
+      .where(and(eq(schema.bookings.id, row.id), eq(schema.bookings.refundPendingAmount, row.pending)))
+      .returning({ status: schema.bookings.status, code: schema.bookings.bookingCode });
+    if (!claimed) continue;
+    const r = await tryRefundBooking(row.id, row.pending, "system:refund-retry", now);
+    if (r.done > 0) {
+      refunded += r.done;
+      await db
+        .update(schema.bookings)
+        .set({
+          refundAmount: sql`${schema.bookings.refundAmount} + ${r.done}`,
+          status: sql`case when ${schema.bookings.status} in ('CANCELLED', 'EXPIRED') then 'REFUNDED' else ${schema.bookings.status} end` as never,
+          updatedAt: now,
+        })
+        .where(eq(schema.bookings.id, row.id));
+      await audit(db, { actor: "system:refund-retry", action: "booking.refund_retried", entity: "Booking", entityId: row.id, after: { refunded: r.done } });
+      if (claimed.status === "CANCELLED" || claimed.status === "EXPIRED") notifyCancelled(row.id, r.done, `refund:${row.id}:${now.getTime()}`);
+    }
+    // Put back what is still owed. If nothing refundable is left (refunded by hand meanwhile), drop it.
+    const left = r.error ? row.pending - r.done : 0;
+    if (left > 0) {
+      await db.update(schema.bookings).set({ refundPendingAmount: sql`${schema.bookings.refundPendingAmount} + ${left}` }).where(eq(schema.bookings.id, row.id));
+      console.warn(`[refund] retry for ${claimed.code} failed: ${r.error}`);
+      void alertOwner(`refund_failed_${row.id}`, `Refund of ${formatINR(left)} for booking ${claimed.code} is still failing. Check the payment dashboard.`, now);
+    }
+  }
+  return refunded;
 }
 
 export type CancelRefund = { mode: "POLICY" } | { mode: "FULL" } | { mode: "NONE" } | { mode: "PARTIAL"; amount: number };
@@ -559,12 +680,14 @@ export async function cancelBooking(
   let refunded = 0;
   let refundError: string | undefined;
   if (refundDue > 0) {
-    try {
-      refunded = await refundBookingPayments(booking.id, refundDue, input.actor, now);
+    const r = await tryRefundBooking(booking.id, refundDue, input.actor, now);
+    refunded = r.done;
+    if (refunded > 0) {
       await db.update(schema.bookings).set({ status: "REFUNDED", refundAmount: booking.refundAmount + refunded, updatedAt: now }).where(eq(schema.bookings.id, booking.id));
-    } catch (e) {
-      refundError = e instanceof Error ? e.message : String(e);
-      await audit(db, { actor: input.actor, action: "booking.refund_failed", entity: "Booking", entityId: booking.id, after: { refundDue, error: refundError } });
+    }
+    if (r.error) {
+      refundError = r.error;
+      await recordPendingRefund(booking.id, refundDue - refunded, input.actor, r.error, now);
     }
   }
   if (booking.advanceAmount > 0 || booking.source !== "ONLINE" || refunded > 0) notifyCancelled(booking.id, refunded);
@@ -578,9 +701,20 @@ export async function refundCancelledBooking(bookingId: string, amount: number, 
   if (!["CANCELLED", "EXPIRED", "REFUNDED", "NO_SHOW"].includes(d.booking.status)) throw new AppError("NOT_ALLOWED", "Cancel the booking first.");
   const paid = netPaid(d.payments);
   if (amount <= 0 || amount > paid) throw new AppError("VALIDATION", `Refund must be between ₹1 and ${formatINR(paid)}.`);
-  const refunded = await refundBookingPayments(bookingId, amount, actor, now);
+  const r = await tryRefundBooking(bookingId, amount, actor, now);
+  const refunded = r.done;
   const db = await getDb();
-  await db.update(schema.bookings).set({ status: d.booking.status === "NO_SHOW" ? "NO_SHOW" : "REFUNDED", refundAmount: d.booking.refundAmount + refunded, updatedAt: now }).where(eq(schema.bookings.id, bookingId));
+  if (r.error && refunded === 0) throw new AppError("PROVIDER_ERROR", `Refund failed: ${r.error}`);
+  // A manual refund also settles any automatic retry still pending for this booking. [SEC-45]
+  await db
+    .update(schema.bookings)
+    .set({
+      status: d.booking.status === "NO_SHOW" ? "NO_SHOW" : "REFUNDED",
+      refundAmount: sql`${schema.bookings.refundAmount} + ${refunded}`,
+      refundPendingAmount: sql`greatest(0, ${schema.bookings.refundPendingAmount} - ${refunded})`,
+      updatedAt: now,
+    })
+    .where(eq(schema.bookings.id, bookingId));
   notifyCancelled(bookingId, refunded, `refund:${bookingId}:${now.getTime()}`);
   return refunded;
 }
@@ -614,6 +748,7 @@ export async function createAdminBooking(
     const booking = await transactionWithRetry(db, async (tx) => {
       const customer = await upsertCustomer(tx, input.phone, input.name, input.whatsappOptIn || undefined, now);
       await lockCourtDay(tx, input.courtId, input.date);
+      await assertNotBlocked(tx, input.courtId, startAt, endAt);
       await expireStaleOverlapping(tx, input.courtId, startAt, endAt, now);
       const [b] = await tx
         .insert(schema.bookings)
@@ -701,6 +836,14 @@ export async function createBlocks(
 ) {
   const db = await getDb();
   const created = await db.transaction(async (tx) => {
+    // Same court-day locks as holds and walk-ins (sorted, so two block requests can't deadlock), so a
+    // booking can't slip in between the overlap check below and the insert. [SEC-47]
+    const days = new Set<string>();
+    for (const r of input.ranges) {
+      days.add(istDateKey(r.startAt));
+      days.add(istDateKey(new Date(r.endAt.getTime() - 1)));
+    }
+    for (const day of [...days].sort()) await lockCourtDay(tx, input.courtId, day);
     const conflicts: string[] = [];
     for (const r of input.ranges) {
       if (r.endAt <= r.startAt) throw new AppError("VALIDATION", "End time must be after start time.");
@@ -712,7 +855,8 @@ export async function createBlocks(
             eq(schema.bookings.courtId, input.courtId),
             lt(schema.bookings.startAt, r.endAt),
             gt(schema.bookings.endAt, r.startAt),
-            sql`(${schema.bookings.status} = 'CONFIRMED' OR (${schema.bookings.status} = 'PENDING_PAYMENT' AND ${schema.bookings.holdExpiresAt} > ${now}))`,
+            // Typed comparison (not a raw Date in sql``): postgres-js rejects Date parameters in raw SQL. [SEC-47]
+            or(eq(schema.bookings.status, "CONFIRMED"), and(eq(schema.bookings.status, "PENDING_PAYMENT"), gt(schema.bookings.holdExpiresAt, now))),
           ),
         );
       conflicts.push(...hits.map((h) => h.code));

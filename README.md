@@ -4,6 +4,7 @@ A complete booking site for a box-cricket + pickleball venue: public website, li
 
 - **Stack:** Next.js 16 (App Router) · TypeScript (strict) · Tailwind CSS v4 · Postgres + Drizzle ORM (raw SQL migrations) · Zod · Razorpay · Vitest · Playwright
 - **Branding:** everything lives in [`config/site.ts`](config/site.ts) (name, phone, address, map, images, FAQ, amenities).
+- **How it works:** [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) explains every flow, table, limit and setting, with diagrams. Check its file paths with `node scripts/check-doc-paths.mjs`.
 
 ## Quick start (zero setup)
 

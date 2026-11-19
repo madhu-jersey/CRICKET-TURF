@@ -2,7 +2,7 @@
 
 **Scope:** full codebase review + testing of the Next.js turf booking site (box cricket + pickleball): public booking with phone OTP, ₹ advance payment (Razorpay / mock), WhatsApp messaging, owner/staff dashboard.
 **Environment:** local only — embedded Postgres (PGlite, real Postgres 17 with the real migrations), mock OTP / WhatsApp / payment providers, isolated production build on `localhost:3100`. No production systems, real payment accounts or real phone numbers were used.
-**Date:** 18 Nov 2026 · **Version tested:** `main` + the fixes in this report. **Follow-up round (SEC-33 → SEC-40):** same day, branch `security-review`; real Postgres 17 (embedded, 25 connections) added for race testing. **Third round (SEC-41 → SEC-43):** 19 Nov 2026 — admin recovery codes, admin pages tested on a phone screen, fresh code for refund cancels.
+**Date:** 18 Nov 2026 · **Version tested:** `main` + the fixes in this report. **Follow-up round (SEC-33 → SEC-40):** same day, branch `security-review`; real Postgres 17 (embedded, 25 connections) added for race testing. **Third round (SEC-41 → SEC-43):** 19 Nov 2026 — admin recovery codes, admin pages tested on a phone screen, fresh code for refund cancels. **Fourth round (SEC-44 → SEC-48):** same day — defects found while writing `docs/ARCHITECTURE.md`.
 
 > Note: this site **keeps online advance payment** (owner decision), so the review covers both the "no payment" checklist (booking abuse, OTP flooding, access control) and the payment checks (fake/forged/replayed payments, refunds).
 
@@ -13,16 +13,16 @@
 | Severity | Found | Fixed | Accepted risk | Needs owner action |
 |---|---|---|---|---|
 | Critical | 1 | 1 | – | – |
-| High | 7 | 7 | – | – |
-| Medium | 15 | 15 | – | – |
+| High | 8 | 8 | – | – |
+| Medium | 19 | 19 | – | – |
 | Low | 11 | 10 | 1 | – |
 | Info | – | – | 3 | 1 (Supabase RLS, if used) |
 
-Counts include the follow-up rounds (SEC-33 → SEC-43). Turnstile is no longer "needs owner action": a live server now refuses to start without it.
+Counts include the follow-up rounds (SEC-33 → SEC-48). Turnstile is no longer "needs owner action": a live server now refuses to start without it.
 
 **Overall risk after fixes: Low.** Every Critical, High and Medium issue is fixed and covered by an automated test. The code is **safe to go live once the go-live checklist (§5) is done**. The new startup check refuses to run a live (`DEMO_MODE=false`) server until the critical items are set.
 
-**Tests (after the third round, 19 Nov 2026):** 121 Vitest tests on PGlite (+8 race tests skipped there), **129/129 on real Postgres 17** (`npm run test:realdb`), **8/8 race tests** with 25 truly parallel connections (`npm run test:concurrency`), **32 Playwright tests** (desktop + mobile; the admin schedule, walk-in, bookings list and settings tests now run on both; 14 desktop-only tests skipped on mobile). All pass. `npm audit --omit=dev`: 0 vulnerabilities.
+**Tests (after the fourth round, 19 Nov 2026):** 127 Vitest tests on PGlite (+10 race tests skipped there), **137/137 on real Postgres 17** (`npm run test:realdb`), **10/10 race tests** with 25 truly parallel connections (`npm run test:concurrency`), **33 Playwright tests** pass (desktop + mobile; 15 desktop-only tests skipped on mobile). All pass. `npm audit --omit=dev`: 0 vulnerabilities.
 
 The most important findings were:
 - **SEC-01 (Critical):** on a live site where `PAYMENT_PROVIDER` wasn't set, the demo "Simulate success" checkout still worked, so **anyone could book for free**.
@@ -247,6 +247,35 @@ Razorpay Orders/Refunds API · WhatsApp Cloud API or BSP · MSG91 SMS · Cloudfl
 - **Fix:** the verified-phone cookie now records how the phone was verified (`otp` or `trusted`) and when. A customer cancel that would refund money needs a code typed in the last **10 minutes**; otherwise the server answers `FRESH_OTP_REQUIRED` and nothing changes. "Send code" with `fresh: true` skips the remembered-device shortcut. The check runs in the route (before the 3-cancels-a-day counter, so a refused try doesn't use one up) and again inside the locked cancel transaction, using the exact refund that would be paid. Cancels with nothing to refund (inside the cutoff, or nothing paid online) behave as before. Old cookies without the new fields count as "not fresh". The cancel screen asks for a new code whenever a refund is due. Staff/owner cancels are unchanged.
 - **Tests:** `recovery-refund.test.ts › SEC-43` (refused without a fresh code with no change to booking or payment; works with one; no-refund cancels unaffected; admin cancels unaffected; 10-minute window; legacy tokens); `http.spec.ts › SEC-43` (remembered device → 401 `FRESH_OTP_REQUIRED`, booking still confirmed; fresh code → refund; walk-in with no online payment → cancel works on the remembered device); `booking.spec.ts › cancel with refund` (the browser flow now asks for a new code).
 
+### Fourth round (SEC-44 → SEC-48)
+
+Found while writing `docs/ARCHITECTURE.md` from the code (SEC-44 → SEC-47); SEC-48 was exposed by the new SEC-47 test on real Postgres.
+
+### SEC-44 — Gallery images stored in the database never loaded · **Medium** · Fixed
+- **Proof:** with the default `STORAGE_PROVIDER=db`, `lib/storage.ts` saves uploads with the URL `/api/files/<id>`, but no such route existed (git history shows it never did). Every uploaded photo was a broken image. Supabase-hosted photos would also have been rejected by `next/image` (host not in `remotePatterns`).
+- **Fix:** `app/api/files/[id]/route.ts` serves stored files: UUID ids only, only `image/*` rows (all are WebP re-encoded by `sanitizeImage()`), `Cache-Control: public, max-age=31536000, immutable`, `nosniff`, `default-src 'none'` CSP, `Cross-Origin-Resource-Policy: same-origin`. `next.config.ts` allows `*.supabase.co/storage/v1/object/public/**`.
+- **Tests:** `tests/security/review-fixes.test.ts › SEC-44` (stored → served as WebP; unknown and path-like ids 404); `http.spec.ts › SEC-44` (owner uploads a JPEG with EXIF → served as WebP without the metadata → the Next.js image optimiser loads it → after delete it 404s).
+
+### SEC-45 — A failed automatic refund after a late payment was lost · **High** · Fixed
+- **Proof:** in `confirmPayment()`, the refund for a late payment whose slot was taken ran after the transaction committed. If the Razorpay refund call failed, the webhook returned 500; Razorpay's retry then found the payment `PAID` and returned `ALREADY_PROCESSED`, so the refund was never retried, nothing was audit-logged and nobody was told. The customer's money stayed with the venue. Separately, two refunds of one payment running at once (e.g. a retry and an owner's manual refund) could both call the provider.
+- **Fix:** a failed refund (late payment, customer cancel, admin cancel) records the amount still owed in the new `Booking.refundPendingAmount` (migration 0008), writes `booking.refund_failed`, and alerts the owner (once per booking per day). The webhook returns 200. The 15-minute cron's `retryPendingRefunds()` claims each pending amount with a compare-and-set, refunds, and puts back whatever still fails. Each refund now reserves its amount on the Payment row (`refundAmount + x ≤ amount`) before calling the provider and releases it on failure, so no combination of retries and manual refunds can pay back more than was paid. An owner's manual refund also settles the pending amount. The admin drawer shows "Refund pending", and the customer is told the refund will be retried.
+- **Tests:** `review-fixes.test.ts › SEC-45` (late payment with a failing provider → webhook succeeds, pending 300, audit + alert; retry while still failing keeps it; retry after recovery refunds and notifies once; manual refund settles the pending amount so the cron doesn't pay again); `races.test.ts` (3 cron retries + 3 owner refunds in parallel → the provider is called once, ₹300 refunded in total).
+
+### SEC-46 — WhatsApp OTP failures were reported as "code sent" · **Medium** · Fixed
+- **Proof:** `WhatsAppOtp.send()` queued the message and returned success even when all three delivery attempts failed (the outbox swallows errors). Customers saw "code sent" and waited for a code that never came, and the admin login's SMS fallback (which only ran when sending threw) could never run — with WhatsApp down, admins with 2FA were locked out.
+- **Fix:** `dispatchMessage()` returns the final status; `WhatsAppOtp` throws `PROVIDER_ERROR` when delivery failed. `lib/providers/otp.ts › deliverOtpCode()` is shared by customer OTPs and admin codes: the configured channel first, MSG91 SMS if that fails and its keys are set. If every channel fails, the customer's new code is withdrawn and they see an error.
+- **Tests:** `review-fixes.test.ts › SEC-46` (WhatsApp down, no SMS → `PROVIDER_ERROR`, code withdrawn, outbox row FAILED after 3 attempts; WhatsApp down with MSG91 → code sent by SMS; admin login code: error without SMS, SMS with it).
+
+### SEC-47 — A blocked slot and a booking could be created for the same time · **Medium** · Fixed
+- **Proof:** blocks are not part of the `no_overlap` exclusion constraint. `createBlocks()` checked for overlapping bookings without any lock, and holds read the slot grid before their transaction, so a block and a hold created at the same moment could both succeed. With the fix removed, the new race test failed 3 runs out of 3 (e.g. "19:00: block OK and 1 of 6 holds OK").
+- **Fix:** `createBlocks()` takes the same court-day advisory locks as holds and walk-ins (every IST day a block touches, in sorted order), and holds and walk-ins re-check blocks inside their transaction after the lock (`assertNotBlocked()`).
+- **Tests:** `races.test.ts` — 5 rounds of 6 holds + 1 block in parallel on real Postgres: either the block wins and no hold does, or exactly one hold wins and the block is refused.
+
+### SEC-48 — Creating a blocked slot crashed on real Postgres · **Medium** · Fixed
+- **Proof:** the SEC-47 test on Postgres 17 failed with `ERR_INVALID_ARG_TYPE` from `createBlocks()`: a JavaScript `Date` was embedded in a raw `sql` fragment. PGlite (used by `npm test` and the e2e server) accepts it; postgres-js (production) does not. On a live site the owner could not block any slot.
+- **Fix:** the overlap check uses typed Drizzle operators (`or` / `and` / `gt`). No other raw `sql` fragment embeds a date.
+- **Tests:** `races.test.ts` exercises `createBlocks()` on Postgres 17 (CI `concurrency` job). Lesson recorded in `docs/ARCHITECTURE.md` §15: run `npm run test:realdb` before every release, not only `npm test`.
+
 ### SEC-28 — Dev dependency advisory (picomatch ReDoS via vitest) · **Low** · Fixed (resolved upstream)
 - Earlier: 5 high advisories in `picomatch` inside the test runner. Re-checked 18 Nov 2026: `npm audit` and `npm audit --omit=dev` both report **0 vulnerabilities**. CI now fails on any high advisory in production dependencies.
 
@@ -336,9 +365,9 @@ Razorpay Orders/Refunds API · WhatsApp Cloud API or BSP · MSG91 SMS · Cloudfl
 
 | Job | What it does | Fails the build when | Local result |
 |---|---|---|---|
-| unit | `npm ci`, typecheck, `npm test` (PGlite) | any test fails | 121 passed, 8 skipped |
-| concurrency | `postgres:17` service; `npm run test:concurrency` and `npm run test:realdb` | any test fails | 8/8 and 129/129 (embedded Postgres 17) |
-| e2e | Playwright desktop + mobile, incl. HTTP security specs | any test fails | 32 passed, 14 skipped (desktop-only) |
+| unit | `npm ci`, typecheck, `npm test` (PGlite) | any test fails | 127 passed, 10 skipped |
+| concurrency | `postgres:17` service; `npm run test:concurrency` and `npm run test:realdb` | any test fails | 10/10 and 137/137 (embedded Postgres 17) |
+| e2e | Playwright desktop + mobile, incl. HTTP security specs | any test fails | 33 passed, 15 skipped (desktop-only) |
 | secrets | gitleaks over the full history (`fetch-depth: 0`) | any leak found | not run locally; regex scan: 0 hits |
 | sast | semgrep `p/nextjs p/typescript p/secrets p/owasp-top-ten` | any ERROR finding | not run locally |
 | audit | `npm audit --omit=dev --audit-level=high` | high/critical advisory | 0 vulnerabilities |

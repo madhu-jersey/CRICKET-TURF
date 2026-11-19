@@ -38,7 +38,10 @@ export class WhatsAppOtp implements OtpProvider {
     // OTP is a user-initiated authentication message, so it is sent regardless of marketing opt-in.
     // The code itself is masked in the outbox log.
     const id = await enqueueMessage(db, { phone, template: "otp_code", params: { code }, logParams: { code: "••••••" }, optedIn: true });
-    if (id) await dispatchMessage(id, { code });
+    // Report real delivery: if all 3 attempts fail, the caller must know (and can fall back to SMS)
+    // instead of telling the user "code sent". [SEC-46]
+    const status = id ? await dispatchMessage(id, { code }) : "MISSING";
+    if (status !== "SENT" && status !== "MOCKED") throw new AppError("PROVIDER_ERROR", "We couldn't send the code on WhatsApp. Please try again in a minute.");
     return {};
   }
 }
@@ -74,5 +77,29 @@ export function getOtpProvider(): OtpProvider {
       return new SmsOtp(env.str("MSG91_AUTH_KEY"), env.str("MSG91_OTP_TEMPLATE_ID"));
     default:
       return new MockOtp();
+  }
+}
+
+/** MSG91 SMS as a backup channel, if its keys are configured. */
+export function smsFallback(): SmsOtp | null {
+  const key = env.str("MSG91_AUTH_KEY");
+  const tpl = env.str("MSG91_OTP_TEMPLATE_ID");
+  return key && tpl ? new SmsOtp(key, tpl) : null;
+}
+
+/**
+ * Sends a code over the configured OTP channel. If that channel fails (e.g. WhatsApp is down or the
+ * template is rejected) and MSG91 is configured, the code goes by SMS instead. Used for customer
+ * OTPs and admin login/reset codes. Throws PROVIDER_ERROR only when every channel failed. [SEC-46]
+ */
+export async function deliverOtpCode(phone: string, code: string): Promise<{ devCode?: string; channel: OtpProvider["name"] }> {
+  const primary = getOtpProvider();
+  try {
+    return { ...(await primary.send(phone, code)), channel: primary.name };
+  } catch (e) {
+    const sms = primary.name === "sms" ? null : smsFallback();
+    if (!sms) throw e;
+    console.warn(`[otp] ${primary.name} delivery failed, falling back to SMS: ${e instanceof Error ? e.message : e}`);
+    return { ...(await sms.send(phone, code)), channel: "sms" };
   }
 }

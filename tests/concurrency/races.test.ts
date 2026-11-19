@@ -12,7 +12,8 @@ import { seedDatabase } from "@/db/seed";
 import { addDays, istDateKey } from "@/lib/time";
 import { flushBackground } from "@/lib/background";
 import { getPaymentProvider, webhookSignature, type MockPaymentProvider } from "@/lib/providers/payment";
-import { cancelBooking, createOnlineHold, handlePaymentWebhook } from "@/lib/booking/service";
+import { cancelBooking, createBlocks, createOnlineHold, handlePaymentWebhook, refundCancelledBooking, retryPendingRefunds } from "@/lib/booking/service";
+import { istToUtc } from "@/lib/time";
 import { getBookingByCode, listCourts } from "@/lib/booking/data";
 import { sendOtp } from "@/lib/otp-service";
 import { hitRateLimit } from "@/lib/ratelimit";
@@ -134,5 +135,51 @@ describe.skipIf(!REAL)("real-Postgres races (parallel connections)", () => {
     const msgs = await db.select().from(schema.messageLogs).where(and(eq(schema.messageLogs.bookingId, d.booking.id), eq(schema.messageLogs.template, "booking_confirmed")));
     expect(msgs).toHaveLength(1);
     expect(maxBusy).toBeGreaterThan(1);
+  });
+  it("a block and holds for the same slot in parallel never both win (SEC-47)", async () => {
+    // Blocks aren't in the exclusion constraint; the court-day lock + in-transaction re-check must
+    // stop a hold from landing under a block created at the same moment (and vice versa).
+    for (const tm of ["18:00", "19:00", "20:00", "21:00", "22:00"]) {
+      const start = istToUtc(DATE, tm);
+      const end = new Date(start.getTime() + 3_600_000);
+      const { result: r, maxBusy } = await t.overlap(() =>
+        Promise.all([
+          ...Array.from({ length: 6 }, () => outcome(hold({ times: [tm] }))),
+          outcome(createBlocks({ courtId: cricketId, ranges: [{ startAt: start, endAt: end }], reason: "MAINTENANCE", note: "race" }, "owner@demo.com")),
+        ]),
+      );
+      const blockWon = r[6] === "OK";
+      const holdsWon = r.slice(0, 6).filter((x) => x === "OK").length;
+      expect(blockWon ? holdsWon : 1, `${tm}: ${JSON.stringify(tally(r))}`).toBe(blockWon ? 0 : 1);
+      expect(r.every((x) => ["OK", "SLOT_TAKEN", "NOT_ALLOWED"].includes(x)), JSON.stringify(r)).toBe(true);
+      expect(maxBusy).toBeGreaterThan(1);
+    }
+  });
+
+  it("parallel refunds of one payment (cron retry + owner) never pay back more than was paid (SEC-45)", async () => {
+    const h = await hold({ times: ["21:00"] });
+    const p = getPaymentProvider() as MockPaymentProvider;
+    const body = JSON.stringify({ event: "payment.captured", payload: { payment: { entity: { id: "pay_race_r", order_id: h.order!.orderId, amount: h.order!.amountPaise } } } });
+    await handlePaymentWebhook(body, webhookSignature(body, p.webhookSecret), "evt_race_r");
+    const d = (await getBookingByCode(h.bookingCode))!;
+    await cancelBooking({ bookingId: d.booking.id, actor: "owner", by: "ADMIN", refund: { mode: "NONE" } });
+    await db.update(schema.bookings).set({ refundPendingAmount: 300 }).where(eq(schema.bookings.id, d.booking.id));
+    let calls = 0;
+    const realRefund = p.refund.bind(p);
+    p.refund = async () => (calls++, realRefund());
+    try {
+      await t.overlap(() =>
+        Promise.all([
+          ...Array.from({ length: 3 }, () => outcome(retryPendingRefunds())),
+          ...Array.from({ length: 3 }, () => outcome(refundCancelledBooking(d.booking.id, 300, "owner@demo.com"))),
+        ]),
+      );
+    } finally {
+      p.refund = realRefund;
+    }
+    const after = (await getBookingByCode(h.bookingCode))!;
+    expect(after.payments.reduce((s, x) => s + x.refundAmount, 0)).toBe(300);
+    expect(calls).toBe(1);
+    expect(after.booking.refundPendingAmount).toBe(0);
   });
 });

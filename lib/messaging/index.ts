@@ -11,6 +11,7 @@ import { getMessagingProvider } from "@/lib/providers/messaging";
 import { renderTemplate, type TemplateName } from "@/lib/messaging/templates";
 import { runInBackground } from "@/lib/background";
 import { maskForLog } from "@/lib/security";
+import type { MessageStatus } from "@/db/schema";
 
 export const MAX_MESSAGE_ATTEMPTS = 3;
 
@@ -52,13 +53,15 @@ export async function enqueueMessage(q: Queryable, input: EnqueueInput): Promise
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
- * Delivers a queued message. `realParams` carries unmasked params (OTP codes) that are not
- * stored in the log; when omitted, the stored payload is used.
+ * Delivers a queued message and returns its final status ("FAILED" after 3 attempts). `realParams`
+ * carries unmasked params (OTP codes) that are not stored in the log; when omitted, the stored
+ * payload is used.
  */
-export async function dispatchMessage(id: string, realParams?: Record<string, string>): Promise<void> {
+export async function dispatchMessage(id: string, realParams?: Record<string, string>): Promise<MessageStatus | "MISSING"> {
   const db = await getDb();
   const [row] = await db.select().from(schema.messageLogs).where(eq(schema.messageLogs.id, id));
-  if (!row || row.status === "SENT" || row.status === "MOCKED") return;
+  if (!row) return "MISSING";
+  if (row.status === "SENT" || row.status === "MOCKED") return row.status;
   const provider = getMessagingProvider();
   const params = realParams ?? row.payload;
   const language = row.language === "te" ? "te" : "en";
@@ -77,7 +80,7 @@ export async function dispatchMessage(id: string, realParams?: Record<string, st
         .update(schema.messageLogs)
         .set({ status: res.mocked ? "MOCKED" : "SENT", attempts, providerMessageId: res.providerMessageId, provider: provider.name, error: null, updatedAt: new Date() })
         .where(eq(schema.messageLogs.id, id));
-      return;
+      return res.mocked ? "MOCKED" : "SENT";
     } catch (e) {
       const error = `Attempt ${attempts}: ${e instanceof Error ? e.message : String(e)}`.slice(0, 500);
       const final = attempts >= MAX_MESSAGE_ATTEMPTS;
@@ -86,10 +89,11 @@ export async function dispatchMessage(id: string, realParams?: Record<string, st
         .set({ status: final ? "FAILED" : "QUEUED", attempts, error, provider: provider.name, updatedAt: new Date() })
         .where(eq(schema.messageLogs.id, id));
       console.warn(`[messaging] ${row.template} → ${maskForLog(row.phone)} failed (${error})`);
-      if (final) return;
+      if (final) return "FAILED";
       await sleep(env.messageRetryBaseMs * 2 ** (attempts - 1));
     }
   }
+  return "FAILED";
 }
 
 /** Dispatch several queued messages without blocking the caller. Errors are swallowed and logged. */

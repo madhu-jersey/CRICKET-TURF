@@ -6,7 +6,11 @@ const nextConfig: NextConfig = {
   distDir: process.env.NEXT_DIST_DIR || ".next",
   serverExternalPackages: ["@electric-sql/pglite", "postgres", "bcryptjs"],
   images: {
-    remotePatterns: [{ protocol: "https", hostname: "images.unsplash.com" }],
+    remotePatterns: [
+      { protocol: "https", hostname: "images.unsplash.com" },
+      // Gallery uploads with STORAGE_PROVIDER=supabase (public bucket URLs).
+      { protocol: "https", hostname: "*.supabase.co", pathname: "/storage/v1/object/public/**" },
+    ],
     formats: ["image/avif", "image/webp"],
   },
   poweredByHeader: false,
