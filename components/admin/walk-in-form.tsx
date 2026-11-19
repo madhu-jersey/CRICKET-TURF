@@ -115,11 +115,11 @@ export function WalkInForm({ courts, initial }: { courts: { id: string; name: st
       </section>
 
       <section className="space-y-3 rounded-2xl border border-zinc-200 bg-white p-4 sm:p-5">
-        {done && <Alert tone="success">Booked <strong className="font-mono">{done.code}</strong>. <a className="underline" href={`/admin/bookings?q=${done.code}`}>View</a></Alert>}
-        <fieldset className="flex gap-4 text-sm">
+        {done && <Alert tone="success">Booked <strong className="font-mono">{done.code}</strong>. <a className="inline-flex min-h-11 min-w-11 items-center justify-center px-1 font-semibold underline" href={`/admin/bookings?q=${done.code}`}>View</a></Alert>}
+        <fieldset className="flex gap-2 text-sm">
           <legend className="sr-only">Source</legend>
-          <label className="flex items-center gap-1.5"><input type="radio" checked={source === "WALK_IN"} onChange={() => setSource("WALK_IN")} />Walk-in</label>
-          <label className="flex items-center gap-1.5"><input type="radio" checked={source === "PHONE"} onChange={() => setSource("PHONE")} />Phone</label>
+          <label className="flex min-h-11 flex-1 items-center gap-2 rounded-xl border border-zinc-200 px-3 has-[:checked]:border-ink"><input type="radio" className="h-5 w-5" checked={source === "WALK_IN"} onChange={() => setSource("WALK_IN")} />Walk-in</label>
+          <label className="flex min-h-11 flex-1 items-center gap-2 rounded-xl border border-zinc-200 px-3 has-[:checked]:border-ink"><input type="radio" className="h-5 w-5" checked={source === "PHONE"} onChange={() => setSource("PHONE")} />Phone</label>
         </fieldset>
         <div>
           <Label htmlFor="wi-name">Customer name</Label>
@@ -129,7 +129,7 @@ export function WalkInForm({ courts, initial }: { courts: { id: string; name: st
           <Label htmlFor="wi-phone">Mobile (10 digits)</Label>
           <Input id="wi-phone" type="tel" inputMode="numeric" value={phone} onChange={(e) => setPhone(e.target.value.replace(/\D/g, "").slice(0, 10))} required pattern="[6-9][0-9]{9}" className="h-10" />
         </div>
-        <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={optIn} onChange={(e) => setOptIn(e.target.checked)} />Customer agreed to WhatsApp updates</label>
+        <label className="flex min-h-11 items-center gap-3 text-sm"><input type="checkbox" className="h-5 w-5" checked={optIn} onChange={(e) => setOptIn(e.target.checked)} />Customer agreed to WhatsApp updates</label>
         <div className="grid grid-cols-2 gap-3">
           <div>
             <Label htmlFor="wi-amt">Amount received (₹)</Label>

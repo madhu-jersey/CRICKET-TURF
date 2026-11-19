@@ -15,7 +15,7 @@ import { AppError } from "@/lib/errors";
 import { randomToken, safeEqual, sha256Hex, signToken, verifyToken } from "@/lib/security";
 import { hitRateLimit } from "@/lib/ratelimit";
 import { audit } from "@/lib/audit";
-import { admin2faRequired, bcryptCost, issueAdminCode, verifyAdminCode } from "@/lib/auth/admin-core";
+import { admin2faRequired, bcryptCost, ensureRecoveryCodes, issueAdminCode, verifyAdminCode, verifyRecoveryLogin } from "@/lib/auth/admin-core";
 import type { AdminRole, AdminUser } from "@/db/schema";
 
 export { bcryptCost };
@@ -82,11 +82,19 @@ export async function loginAdmin(email: string, password: string, ip: string, op
   return { done: false, challengeId: c.challengeId, maskedPhone: c.maskedPhone, devCode: c.devCode };
 }
 
-/** Step 2: the 2FA code. Creates the session and, if asked, trusts this device for 30 days. */
-export async function verifyAdminLogin(challengeId: string, code: string, ip: string) {
+/**
+ * Step 2: the phone code (or a recovery code). Creates the session and, if asked, trusts this device for
+ * 30 days. A recovery-code login never trusts the device. On the first two-step login the admin's
+ * recovery codes are made and returned once. [SEC-39][SEC-41]
+ */
+export async function verifyAdminLogin(challengeId: string, proof: { code: string } | { recoveryCode: string }, ip: string) {
   if (!(await hitRateLimit(`admin-2fa-ip:${ip}`, 30, 15 * 60_000))) throw new AppError("RATE_LIMITED", "Too many attempts. Try again in 15 minutes.");
-  const { admin, trustDevice } = await verifyAdminCode({ challengeId }, "LOGIN", code);
-  await createSession(admin, ip, "2fa");
+  const viaRecovery = "recoveryCode" in proof;
+  const { admin, trustDevice } = viaRecovery
+    ? { ...(await verifyRecoveryLogin(challengeId, proof.recoveryCode)), trustDevice: false }
+    : await verifyAdminCode({ challengeId }, "LOGIN", proof.code);
+  await createSession(admin, ip, viaRecovery ? "recovery-code" : "2fa");
+  const recoveryCodes = viaRecovery ? undefined : await ensureRecoveryCodes(admin);
   if (trustDevice) {
     (await cookies()).set(ADMIN_TRUST_COOKIE, signToken({ adminId: admin.id, epoch: admin.trustEpoch, exp: Date.now() + ADMIN_TRUST_TTL_MS, purpose: "admin-trust" }, env.appSecret), {
       httpOnly: true,
@@ -96,7 +104,7 @@ export async function verifyAdminLogin(challengeId: string, code: string, ip: st
       maxAge: ADMIN_TRUST_TTL_MS / 1000,
     });
   }
-  return { role: admin.role, mustChangePassword: admin.mustChangePassword };
+  return { role: admin.role, mustChangePassword: admin.mustChangePassword, recoveryCodes };
 }
 
 export async function getAdminSession(): Promise<AdminContext | null> {

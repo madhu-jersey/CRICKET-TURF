@@ -5,8 +5,9 @@ import Link from "next/link";
 import { Button } from "@/components/ui/button";
 import { Alert, Input, Label } from "@/components/ui/field";
 import { api } from "@/lib/utils";
+import { RecoveryCodesPanel } from "@/components/admin/recovery-codes";
 
-type LoginRes = { role?: string; mustChangePassword?: boolean; twoFactor?: boolean; challengeId?: string; maskedPhone?: string; devCode?: string };
+type LoginRes = { role?: string; mustChangePassword?: boolean; twoFactor?: boolean; challengeId?: string; maskedPhone?: string; devCode?: string; recoveryCodes?: string[] };
 
 export function LoginForm({ demo }: { demo: boolean }) {
   const [email, setEmail] = useState("");
@@ -14,6 +15,9 @@ export function LoginForm({ demo }: { demo: boolean }) {
   const [trust, setTrust] = useState(false);
   const [challenge, setChallenge] = useState<{ id: string; maskedPhone: string; devCode?: string } | null>(null);
   const [code, setCode] = useState("");
+  const [useRecovery, setUseRecovery] = useState(false);
+  const [recovery, setRecovery] = useState("");
+  const [newCodes, setNewCodes] = useState<{ codes: string[]; res: LoginRes } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -35,13 +39,32 @@ export function LoginForm({ demo }: { demo: boolean }) {
         }
         done(r);
       } else {
-        done(await api<LoginRes>("/api/admin/login/verify", { method: "POST", json: { challengeId: challenge.id, code } }));
+        const r = await api<LoginRes>("/api/admin/login/verify", {
+          method: "POST",
+          json: useRecovery ? { challengeId: challenge.id, recoveryCode: recovery } : { challengeId: challenge.id, code },
+        });
+        // First two-step login: show the new recovery codes once before going in. [SEC-41]
+        if (r.recoveryCodes?.length) {
+          setNewCodes({ codes: r.recoveryCodes, res: r });
+          setBusy(false);
+          return;
+        }
+        done(r);
       }
     } catch (err) {
       setError((err as Error).message);
       setBusy(false);
     }
   };
+
+  if (newCodes) {
+    return (
+      <div className="mt-6 rounded-2xl bg-white p-6 shadow-sm">
+        <h2 className="mb-3 text-lg font-bold">Your recovery codes</h2>
+        <RecoveryCodesPanel codes={newCodes.codes} onDone={() => done(newCodes.res)} doneLabel="Continue to dashboard" />
+      </div>
+    );
+  }
 
   return (
     <form onSubmit={submit} className="mt-6 space-y-4 rounded-2xl bg-white p-6 shadow-sm">
@@ -60,8 +83,8 @@ export function LoginForm({ demo }: { demo: boolean }) {
             <Label htmlFor="password">Password</Label>
             <Input id="password" type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} required />
           </div>
-          <label className="flex items-center gap-2 text-sm">
-            <input type="checkbox" checked={trust} onChange={(e) => setTrust(e.target.checked)} />
+          <label className="flex min-h-11 items-center gap-3 text-sm">
+            <input type="checkbox" className="h-5 w-5" checked={trust} onChange={(e) => setTrust(e.target.checked)} />
             Trust this device for 30 days (skip the code next time)
           </label>
         </>
@@ -70,21 +93,41 @@ export function LoginForm({ demo }: { demo: boolean }) {
           <p className="text-sm text-zinc-600">
             We sent a 6-digit code to <strong>{challenge.maskedPhone}</strong>.
           </p>
-          {challenge.devCode && (
+          {challenge.devCode && !useRecovery && (
             <p className="mt-2 rounded-lg bg-amber-50 px-3 py-2 text-sm" data-testid="admin-dev-code">
               Demo code: <strong className="font-mono">{challenge.devCode}</strong>
             </p>
           )}
-          <Label htmlFor="code" className="mt-3">Login code</Label>
-          <Input id="code" inputMode="numeric" autoComplete="one-time-code" maxLength={6} value={code} onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))} required autoFocus />
+          {!useRecovery ? (
+            <>
+              <Label htmlFor="code" className="mt-3">Login code</Label>
+              <Input id="code" inputMode="numeric" autoComplete="one-time-code" maxLength={6} value={code} onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))} required autoFocus />
+            </>
+          ) : (
+            <>
+              <Label htmlFor="recovery" className="mt-3">Recovery code</Label>
+              <Input id="recovery" autoComplete="off" autoCapitalize="characters" spellCheck={false} placeholder="ABCDE-FGHJK" maxLength={20} value={recovery} onChange={(e) => setRecovery(e.target.value.toUpperCase())} required autoFocus />
+              <p className="mt-1 text-xs text-zinc-500">Each recovery code works once. The owner is told when one is used.</p>
+            </>
+          )}
+          <button
+            type="button"
+            className="mt-2 min-h-11 text-sm font-semibold underline"
+            onClick={() => {
+              setUseRecovery((v) => !v);
+              setError(null);
+            }}
+          >
+            {useRecovery ? "Use the code from my phone" : "Lost your phone? Use a recovery code"}
+          </button>
         </div>
       )}
       {error && <Alert>{error}</Alert>}
       <Button type="submit" variant="dark" size="lg" className="w-full" loading={busy}>
-        {challenge ? "Verify code" : "Sign in"}
+        {challenge ? (useRecovery ? "Use recovery code" : "Verify code") : "Sign in"}
       </Button>
       <p className="text-center text-sm">
-        <Link href="/admin/forgot" className="font-semibold underline">Forgot password?</Link>
+        <Link href="/admin/forgot" className="inline-flex min-h-11 items-center font-semibold underline">Forgot password?</Link>
       </p>
     </form>
   );

@@ -12,7 +12,16 @@ async function login(page: Page) {
   const code = (await page.getByTestId("admin-dev-code").locator("strong").textContent())!.trim();
   await page.getByLabel("Login code").fill(code);
   await page.getByRole("button", { name: "Verify code" }).click();
-  await expect(page.getByRole("heading", { name: "Overview" })).toBeVisible();
+  // The first two-step login on this server shows the recovery codes once. [SEC-41]
+  const overview = page.getByRole("heading", { name: "Overview" });
+  const codes = page.getByTestId("recovery-codes");
+  await expect(overview.or(codes)).toBeVisible();
+  if (await codes.isVisible()) {
+    await expect(page.getByTestId("recovery-code")).toHaveCount(10);
+    await page.getByTestId("recovery-saved").check();
+    await page.getByTestId("recovery-continue").click();
+  }
+  await expect(overview).toBeVisible();
 }
 
 /** Next weekday (Mon–Fri), 1–13 days out, that isn't the seeded holiday at +6. */

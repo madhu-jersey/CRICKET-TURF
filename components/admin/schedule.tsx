@@ -95,17 +95,17 @@ export function Schedule(props: { view: "day" | "week"; date: string; days: stri
       <div className="mb-4 flex flex-wrap items-center gap-2">
         <div className="flex overflow-hidden rounded-lg border border-zinc-300 bg-white text-sm font-semibold">
           {(["day", "week"] as const).map((v) => (
-            <button key={v} onClick={() => nav({ view: v, court: courtId })} aria-pressed={view === v} className={cn("px-3 py-1.5", view === v && "bg-ink text-white")}>
+            <button key={v} onClick={() => nav({ view: v, court: courtId })} aria-pressed={view === v} className={cn("min-h-11 min-w-14 px-3 md:min-h-0 md:py-1.5", view === v && "bg-ink text-white")}>
               {v === "day" ? "Day" : "Week"}
             </button>
           ))}
         </div>
-        <button onClick={() => nav({ date: addDays(date, view === "week" ? -7 : -1) })} className="rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-sm font-semibold" aria-label="Previous">←</button>
-        <input type="date" value={date} onChange={(e) => e.target.value && nav({ date: e.target.value })} aria-label="Date" className="h-9 rounded-lg border border-zinc-300 bg-white px-2 text-sm" />
-        <button onClick={() => nav({ date: addDays(date, view === "week" ? 7 : 1) })} className="rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-sm font-semibold" aria-label="Next">→</button>
-        <button onClick={() => nav({ date: today })} className="rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-sm font-semibold">Today</button>
+        <button onClick={() => nav({ date: addDays(date, view === "week" ? -7 : -1) })} className="min-h-11 min-w-11 rounded-lg border border-zinc-300 bg-white px-3 text-sm font-semibold md:min-h-0 md:py-1.5" aria-label={view === "week" ? "Previous week" : "Previous day"}>←</button>
+        <input type="date" value={date} onChange={(e) => e.target.value && nav({ date: e.target.value })} aria-label="Date" className="h-11 rounded-lg md:h-9 border border-zinc-300 bg-white px-2 text-sm" />
+        <button onClick={() => nav({ date: addDays(date, view === "week" ? 7 : 1) })} className="min-h-11 min-w-11 rounded-lg border border-zinc-300 bg-white px-3 text-sm font-semibold md:min-h-0 md:py-1.5" aria-label={view === "week" ? "Next week" : "Next day"}>→</button>
+        <button onClick={() => nav({ date: today })} className="min-h-11 min-w-11 rounded-lg border border-zinc-300 bg-white px-3 text-sm font-semibold md:min-h-0 md:py-1.5">Today</button>
         {view === "week" && (
-          <select value={courtId} onChange={(e) => nav({ court: e.target.value })} aria-label="Court" className="h-9 rounded-lg border border-zinc-300 bg-white px-2 text-sm">
+          <select value={courtId} onChange={(e) => nav({ court: e.target.value })} aria-label="Court" className="h-11 rounded-lg md:h-9 border border-zinc-300 bg-white px-2 text-sm">
             {courts.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
           </select>
         )}
@@ -120,7 +120,7 @@ export function Schedule(props: { view: "day" | "week"; date: string; days: stri
               role="tab"
               aria-selected={phoneCourt === c.id}
               onClick={() => setPhoneCourt(c.id)}
-              className={cn("shrink-0 rounded-full border px-4 py-2 text-sm font-bold", phoneCourt === c.id ? "border-ink bg-ink text-flood" : "border-zinc-300 bg-white")}
+              className={cn("min-h-11 shrink-0 rounded-full border px-4 text-sm font-bold", phoneCourt === c.id ? "border-ink bg-ink text-flood" : "border-zinc-300 bg-white")}
             >
               {c.name}
             </button>
@@ -128,7 +128,7 @@ export function Schedule(props: { view: "day" | "week"; date: string; days: stri
         </div>
       )}
       <p className="mb-2 text-xs text-zinc-500 md:hidden">Tap a free time to add a walk-in{role === "OWNER" ? " or block it" : ""}. Tap a booking to manage it.</p>
-      <div className="overflow-x-auto rounded-2xl border border-zinc-200 bg-white">
+      <div className="overflow-x-auto rounded-2xl border border-zinc-200 bg-white" data-scroll-grid>
         <div className="grid select-none" style={{ gridTemplateColumns: `56px repeat(${cols.length}, minmax(${view === "week" ? 92 : 120}px, 1fr))` }}>
           <div className="sticky left-0 z-10 border-b border-zinc-200 bg-white" />
           {cols.map((c) => (
@@ -204,7 +204,7 @@ export function Schedule(props: { view: "day" | "week"; date: string; days: stri
                     );
                   }
                   return (
-                    <button key={x.id} type="button" onClick={() => setDrawer(x.id)} className={cn("absolute inset-x-1 overflow-hidden rounded-lg px-2 py-1 text-left text-[11px] shadow-sm hover:ring-2 hover:ring-ink", STATUS_CLS[x.status] ?? "bg-zinc-300")} style={style}>
+                    <button key={x.id} type="button" data-booking-id={x.id} onClick={() => setDrawer(x.id)} className={cn("absolute inset-x-1 overflow-hidden rounded-lg px-2 py-1 text-left text-[11px] shadow-sm hover:ring-2 hover:ring-ink", STATUS_CLS[x.status] ?? "bg-zinc-300")} style={style}>
                       <strong className="block truncate">{x.name}</strong>
                       <span className="block truncate opacity-90">{x.code} · {x.source === "ONLINE" ? "online" : x.source.toLowerCase().replace("_", "-")}</span>
                     </button>
@@ -250,7 +250,7 @@ export function Schedule(props: { view: "day" | "week"; date: string; days: stri
                 />
               </div>
             )}
-            <button className="mt-4 w-full text-sm font-semibold underline" onClick={() => setMenu(null)}>Close</button>
+            <button className="mt-2 min-h-11 w-full text-sm font-semibold underline" onClick={() => setMenu(null)}>Close</button>
           </div>
         </div>
       )}

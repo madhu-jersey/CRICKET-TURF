@@ -7,18 +7,35 @@ import { signToken, verifyToken } from "@/lib/security";
 export const PHONE_COOKIE = "bba_vp";
 export const PHONE_TOKEN_TTL_MS = 30 * 60_000;
 
-export function issuePhoneToken(phone: string, now = Date.now()): string {
-  return signToken({ phone, exp: now + PHONE_TOKEN_TTL_MS, purpose: "phone" }, env.appSecret);
+/** A code typed within this window counts as "fresh" (needed for cancels that refund money). [SEC-43] */
+export const FRESH_OTP_MS = 10 * 60_000;
+/** How the phone was verified: a code just typed ("otp") or a remembered device ("trusted"). */
+export type PhoneVia = "otp" | "trusted";
+export type PhoneProof = { phone: string; via: PhoneVia; at: number };
+
+export function issuePhoneToken(phone: string, now = Date.now(), via: PhoneVia = "otp"): string {
+  return signToken({ phone, exp: now + PHONE_TOKEN_TTL_MS, purpose: "phone", via, at: now }, env.appSecret);
+}
+
+export function readPhoneProof(token: string | undefined): PhoneProof | null {
+  const data = verifyToken<{ phone: string; exp: number; purpose: string; via?: PhoneVia; at?: number }>(token, env.appSecret);
+  if (!data || data.purpose !== "phone") return null;
+  // Tokens from before this field existed are treated as device-verified (not fresh).
+  return { phone: data.phone, via: data.via === "otp" ? "otp" : "trusted", at: typeof data.at === "number" ? data.at : 0 };
 }
 
 export function readPhoneToken(token: string | undefined): string | null {
-  const data = verifyToken<{ phone: string; exp: number; purpose: string }>(token, env.appSecret);
-  return data && data.purpose === "phone" ? data.phone : null;
+  return readPhoneProof(token)?.phone ?? null;
 }
 
-export async function setPhoneCookie(phone: string) {
+/** True when the phone was verified by typing a code in the last FRESH_OTP_MS. */
+export function isFreshOtp(proof: PhoneProof | null, now = Date.now()) {
+  return !!proof && proof.via === "otp" && now - proof.at >= 0 && now - proof.at <= FRESH_OTP_MS;
+}
+
+export async function setPhoneCookie(phone: string, via: PhoneVia = "otp") {
   const jar = await cookies();
-  jar.set(PHONE_COOKIE, issuePhoneToken(phone), {
+  jar.set(PHONE_COOKIE, issuePhoneToken(phone, Date.now(), via), {
     httpOnly: true,
     sameSite: "lax",
     secure: env.isProduction,
@@ -30,6 +47,11 @@ export async function setPhoneCookie(phone: string) {
 export async function getVerifiedPhone(): Promise<string | null> {
   const jar = await cookies();
   return readPhoneToken(jar.get(PHONE_COOKIE)?.value);
+}
+
+export async function getPhoneProof(): Promise<PhoneProof | null> {
+  const jar = await cookies();
+  return readPhoneProof(jar.get(PHONE_COOKIE)?.value);
 }
 
 export async function clearPhoneCookie() {

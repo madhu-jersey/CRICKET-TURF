@@ -110,6 +110,7 @@ const ADMIN_ROUTES: { method: "get" | "post" | "put" | "patch" | "delete"; path:
   { method: "post", path: "/api/admin/users", owner: true, data: {} },
   { method: "patch", path: "/api/admin/users", owner: true, data: {} },
   { method: "post", path: "/api/admin/otp-cap", owner: true, data: { amount: 10 } },
+  { method: "post", path: "/api/admin/account/recovery-codes", owner: false, data: { currentPassword: "x" } },
 ];
 
 test("SEC-14 every admin route: 401 without a session, 403 for STAFF on owner routes, 403 without CSRF", async () => {
@@ -302,4 +303,83 @@ test("SEC-40 changing the policy settings changes every page that shows it", asy
   } finally {
     expect((await put(base)).status()).toBe(200);
   }
+});
+
+test("SEC-43 a refund cancel needs a new code even on a remembered device; a no-refund cancel doesn't", async () => {
+  const { ctx, phone } = await verifiedCtx(); // this device is now remembered for the number
+  const courtId = await cricketCourtId(ctx);
+  const date = istDate(11);
+  const slot = await freeSlot(ctx, courtId, date);
+  const h = await (await ctx.post("/api/bookings", { data: { courtId, date, times: [slot.time], name: "Refund Check", whatsappOptIn: false, acceptTerms: true, idempotencyKey: `rf-${Date.now()}` } })).json();
+  const paid = await ctx.post("/api/payments/mock/simulate", { data: { orderId: h.order.orderId, outcome: "success" } });
+  expect(paid.status()).toBe(200);
+
+  // Re-verify through the remembered device (no code sent) — like coming back later.
+  const trusted = await (await ctx.post("/api/otp/send", { data: { bookingCode: h.bookingCode } })).json();
+  expect(trusted.trusted).toBe(true);
+  const refused = await ctx.post(`/api/bookings/${h.bookingCode}/cancel`);
+  expect(refused.status()).toBe(401);
+  expect((await refused.json()).error.code).toBe("FRESH_OTP_REQUIRED");
+  expect(await (await ctx.get(`/booking/${h.bookingCode}`)).text()).toContain("Confirmed");
+
+  // Asking for a fresh code skips the remembered-device shortcut; after typing it the refund goes through.
+  const s = await (await ctx.post("/api/otp/send", { data: { bookingCode: h.bookingCode, fresh: true } })).json();
+  expect(s.trusted).toBeUndefined();
+  expect((await ctx.post("/api/otp/verify", { data: { bookingCode: h.bookingCode, code: s.devCode } })).status()).toBe(200);
+  const ok = await ctx.post(`/api/bookings/${h.bookingCode}/cancel`);
+  expect(ok.status()).toBe(200);
+  expect((await ok.json()).refunded).toBeGreaterThan(0);
+
+  // Nothing to refund (walk-in, paid at the venue): the remembered device is still enough.
+  const owner = await adminCtx("owner@demo.com");
+  const slot2 = await freeSlot(owner, courtId, date);
+  const w = await (await owner.post("/api/admin/walk-in", { data: { courtId, date, times: [slot2.time], name: "Venue Pay", phone: phone.replace("+91", ""), source: "PHONE", amountReceived: 0, paymentMode: "CASH" }, headers: { "x-csrf-token": await csrfOf(owner) } })).json();
+  expect((await (await ctx.post("/api/otp/send", { data: { bookingCode: w.bookingCode } })).json()).trusted).toBe(true);
+  const free = await ctx.post(`/api/bookings/${w.bookingCode}/cancel`);
+  expect(free.status()).toBe(200);
+  expect((await free.json()).refunded).toBe(0);
+  await ctx.dispose();
+});
+
+test("SEC-41 recovery codes: shown at first 2FA login, work once, regenerate replaces them", async () => {
+  const owner = await adminCtx("owner@demo.com");
+  const email = `recovery.${Date.now()}@example.com`;
+  const created = await owner.post("/api/admin/users", {
+    data: { email, name: "Recovery Test", phone: "9811100066", tempPassword: "Temp-Pass-12345" },
+    headers: { "x-csrf-token": await csrfOf(owner) },
+  });
+  expect(created.status()).toBe(201);
+
+  // First two-step login returns the 10 codes once.
+  const a = await pwRequest.newContext({ baseURL: BASE });
+  const first = await loginWith2fa(a, email, "Temp-Pass-12345");
+  const codes: string[] = first.verified.recoveryCodes;
+  expect(codes).toHaveLength(10);
+  expect((await a.put("/api/admin/password", { data: { currentPassword: "Temp-Pass-12345", newPassword: "Night-Match-2026!" }, headers: { "x-csrf-token": await csrfOf(a) } })).status()).toBe(200);
+
+  // Lost phone: a recovery code instead of the SMS code. Not shown again, and the device isn't trusted.
+  const b = await pwRequest.newContext({ baseURL: BASE });
+  const step1 = await (await b.post("/api/admin/login", { data: { email, password: "Night-Match-2026!", trustDevice: true } })).json();
+  expect(step1.twoFactor).toBe(true);
+  const rec = await b.post("/api/admin/login/verify", { data: { challengeId: step1.challengeId, recoveryCode: codes[0] } });
+  expect(rec.status()).toBe(200);
+  expect((await rec.json()).recoveryCodes).toBeUndefined();
+  expect((await b.get("/admin/account")).status()).toBe(200);
+  const st = await b.storageState();
+  expect(st.cookies.some((c) => c.name === "bba_admin_td")).toBe(false);
+
+  // The same code can't be used twice.
+  const c = await pwRequest.newContext({ baseURL: BASE });
+  const step2 = await (await c.post("/api/admin/login", { data: { email, password: "Night-Match-2026!" } })).json();
+  expect((await c.post("/api/admin/login/verify", { data: { challengeId: step2.challengeId, recoveryCode: codes[0] } })).status()).toBe(400);
+
+  // Regenerate: needs the current password; old codes stop working.
+  expect((await b.post("/api/admin/account/recovery-codes", { data: { currentPassword: "wrong-password" }, headers: { "x-csrf-token": await csrfOf(b) } })).status()).toBe(400);
+  const regen = await b.post("/api/admin/account/recovery-codes", { data: { currentPassword: "Night-Match-2026!" }, headers: { "x-csrf-token": await csrfOf(b) } });
+  expect(regen.status()).toBe(200);
+  const fresh: string[] = (await regen.json()).codes;
+  expect(fresh).toHaveLength(10);
+  expect((await c.post("/api/admin/login/verify", { data: { challengeId: step2.challengeId, recoveryCode: codes[1] } })).status()).toBe(400); // old set
+  expect((await c.post("/api/admin/login/verify", { data: { challengeId: step2.challengeId, recoveryCode: fresh[0] } })).status()).toBe(200);
+  await Promise.all([a.dispose(), b.dispose(), c.dispose()]);
 });

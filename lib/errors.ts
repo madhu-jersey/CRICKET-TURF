@@ -16,6 +16,7 @@ export type ErrorCode =
   | "OTP_INVALID"
   | "OTP_EXPIRED"
   | "OTP_LOCKED"
+  | "FRESH_OTP_REQUIRED"
   | "PROVIDER_ERROR"
   | "INTERNAL";
 
@@ -33,6 +34,7 @@ const STATUS: Record<ErrorCode, number> = {
   OTP_INVALID: 400,
   OTP_EXPIRED: 400,
   OTP_LOCKED: 429,
+  FRESH_OTP_REQUIRED: 401,
   PROVIDER_ERROR: 502,
   INTERNAL: 500,
 };

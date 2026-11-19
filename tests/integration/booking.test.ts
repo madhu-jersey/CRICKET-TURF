@@ -281,7 +281,7 @@ describe("cancellation", () => {
 
   it("customer cancel before cutoff → full advance refund", async () => {
     const d = await confirmedBooking();
-    const r = await cancelBooking({ bookingId: d.booking.id, actor: "customer", by: "CUSTOMER", refund: { mode: "POLICY" } }, NOW);
+    const r = await cancelBooking({ bookingId: d.booking.id, actor: "customer", by: "CUSTOMER", refund: { mode: "POLICY" }, freshOtp: true }, NOW);
     expect(r).toMatchObject({ status: "REFUNDED", refunded: 300 });
     const after = (await getBookingByCode(d.booking.bookingCode))!;
     expect(after.booking.status).toBe("REFUNDED");
@@ -293,14 +293,14 @@ describe("cancellation", () => {
   it("customer cancel 2.5 hours before → still a full refund (2 hour policy)", async () => {
     const d = await confirmedBooking(["15:00"]);
     const at = new Date(d.booking.startAt.getTime() - 150 * 60_000);
-    const r = await cancelBooking({ bookingId: d.booking.id, actor: "customer", by: "CUSTOMER", refund: { mode: "POLICY" } }, at);
+    const r = await cancelBooking({ bookingId: d.booking.id, actor: "customer", by: "CUSTOMER", refund: { mode: "POLICY" }, freshOtp: true }, at);
     expect(r).toMatchObject({ status: "REFUNDED", refunded: 300 });
   });
 
   it("customer cancel inside the cutoff → no refund", async () => {
     const d = await confirmedBooking(["10:00"]);
     const closeToStart = new Date(d.booking.startAt.getTime() - 90 * 60_000); // 1.5 h before: inside the 2 h cutoff
-    const r = await cancelBooking({ bookingId: d.booking.id, actor: "customer", by: "CUSTOMER", refund: { mode: "POLICY" } }, closeToStart);
+    const r = await cancelBooking({ bookingId: d.booking.id, actor: "customer", by: "CUSTOMER", refund: { mode: "POLICY" }, freshOtp: true }, closeToStart);
     expect(r).toMatchObject({ status: "CANCELLED", refunded: 0 });
   });
 
@@ -315,7 +315,7 @@ describe("cancellation", () => {
 
   it("cancelled slot becomes bookable again", async () => {
     const d = await confirmedBooking(["12:00"]);
-    await cancelBooking({ bookingId: d.booking.id, actor: "customer", by: "CUSTOMER", refund: { mode: "POLICY" } }, NOW);
+    await cancelBooking({ bookingId: d.booking.id, actor: "customer", by: "CUSTOMER", refund: { mode: "POLICY" }, freshOtp: true }, NOW);
     await expect(hold({ times: ["12:00"] })).resolves.toMatchObject({ status: "PENDING_PAYMENT" });
   });
 });

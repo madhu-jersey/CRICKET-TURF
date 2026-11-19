@@ -507,7 +507,7 @@ export async function previewCustomerRefund(code: string, now = new Date()) {
 }
 
 export async function cancelBooking(
-  input: { bookingId: string; actor: string; by: "CUSTOMER" | "ADMIN"; refund: CancelRefund; reason?: string },
+  input: { bookingId: string; actor: string; by: "CUSTOMER" | "ADMIN"; refund: CancelRefund; reason?: string; freshOtp?: boolean },
   now = new Date(),
 ): Promise<{ status: Booking["status"]; refunded: number; refundError?: string }> {
   const db = await getDb();
@@ -540,6 +540,11 @@ export async function cancelBooking(
         break;
       case "NONE":
         due = 0;
+    }
+    // Money back needs a code typed just now, even on a remembered device. Checked here, inside the
+    // locked transaction, so it uses the same refund figure that will be paid. [SEC-43]
+    if (input.by === "CUSTOMER" && due > 0 && !input.freshOtp) {
+      throw new AppError("FRESH_OTP_REQUIRED", "For your safety, confirm with a new code sent to your phone before we refund.");
     }
     const [updated] = await tx
       .update(schema.bookings)

@@ -157,6 +157,7 @@ export const adminUsers = pgTable("AdminUser", {
   mustChangePassword: boolean("mustChangePassword").notNull().default(false),
   trustEpoch: integer("trustEpoch").notNull().default(0),
   passwordChangedAt: ts("passwordChangedAt"),
+  recoveryCodesAt: ts("recoveryCodesAt"),
   createdAt: ts("createdAt").notNull().defaultNow(),
 });
 
@@ -261,6 +262,14 @@ export const adminCodes = pgTable("AdminCode", {
   consumedAt: ts("consumedAt"),
   trustDevice: boolean("trustDevice").notNull().default(false),
   ip: text("ip"),
+  createdAt: ts("createdAt").notNull().defaultNow(),
+});
+
+export const adminRecoveryCodes = pgTable("AdminRecoveryCode", {
+  id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+  adminId: text("adminId").notNull(),
+  codeHash: text("codeHash").notNull(),
+  usedAt: ts("usedAt"),
   createdAt: ts("createdAt").notNull().defaultNow(),
 });
 

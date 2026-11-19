@@ -106,7 +106,7 @@ describe("SEC-10 slot squatting limits", () => {
     for (const t of ["06:00", "07:00"]) {
       const h = await hold({ phone, times: [t] });
       const d = (await getBookingByCode(h.bookingCode))!;
-      await cancelBooking({ bookingId: d.booking.id, actor: "c", by: "CUSTOMER", refund: { mode: "POLICY" } });
+      await cancelBooking({ bookingId: d.booking.id, actor: "c", by: "CUSTOMER", refund: { mode: "POLICY" }, freshOtp: true });
     }
     await expect(hold({ phone, times: ["08:00"] })).rejects.toMatchObject({ code: "RATE_LIMITED" });
   });
@@ -145,7 +145,7 @@ describe("SEC-23 cancellation", () => {
 
   it("double cancel in parallel → one cancellation, one refund, one message", async () => {
     const d = await confirmed();
-    const r = await Promise.all([1, 2].map(() => errCode(cancelBooking({ bookingId: d.booking.id, actor: "c", by: "CUSTOMER", refund: { mode: "POLICY" } }))));
+    const r = await Promise.all([1, 2].map(() => errCode(cancelBooking({ bookingId: d.booking.id, actor: "c", by: "CUSTOMER", refund: { mode: "POLICY" }, freshOtp: true }))));
     expect(r.sort()).toEqual(["NOT_ALLOWED", "OK"]);
     await flushBackground();
     const after = (await getBookingByCode(d.booking.bookingCode))!;
@@ -157,10 +157,10 @@ describe("SEC-23 cancellation", () => {
   it("refund cutoff is enforced on the server (no refund inside 2 h, no online cancel after start)", async () => {
     const d = await confirmed(["14:00"]);
     const inside = new Date(d.booking.startAt.getTime() - 60 * 60_000);
-    expect((await cancelBooking({ bookingId: d.booking.id, actor: "c", by: "CUSTOMER", refund: { mode: "POLICY" } }, inside)).refunded).toBe(0);
+    expect((await cancelBooking({ bookingId: d.booking.id, actor: "c", by: "CUSTOMER", refund: { mode: "POLICY" }, freshOtp: true }, inside)).refunded).toBe(0);
     const d2 = await confirmed(["15:00"]);
     const afterStart = new Date(d2.booking.startAt.getTime() + 60_000);
-    expect(await errCode(cancelBooking({ bookingId: d2.booking.id, actor: "c", by: "CUSTOMER", refund: { mode: "POLICY" } }, afterStart))).toBe("NOT_ALLOWED");
+    expect(await errCode(cancelBooking({ bookingId: d2.booking.id, actor: "c", by: "CUSTOMER", refund: { mode: "POLICY" }, freshOtp: true }, afterStart))).toBe("NOT_ALLOWED");
   });
 });
 

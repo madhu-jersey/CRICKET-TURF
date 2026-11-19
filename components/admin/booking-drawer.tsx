@@ -88,7 +88,7 @@ export function BookingDrawer({ id, onClose, role }: { id: string | null; onClos
             <p className="text-xs font-semibold uppercase text-zinc-500">Booking</p>
             <h2 id="drawer-title" className="font-mono text-2xl font-bold">{b?.bookingCode ?? "…"}</h2>
           </div>
-          <button onClick={onClose} className="rounded-lg border border-zinc-300 px-3 py-1.5 text-sm font-semibold" autoFocus>Close</button>
+          <button onClick={onClose} className="min-h-11 rounded-lg border border-zinc-300 px-4 text-sm font-semibold" autoFocus>Close</button>
         </div>
         {error && <Alert className="mt-4">{error}</Alert>}
         {msg && <Alert tone="success" className="mt-4">{msg}</Alert>}
@@ -121,22 +121,22 @@ export function BookingDrawer({ id, onClose, role }: { id: string | null; onClos
                     <option value="UPI">UPI</option>
                     <option value="CARD">Card</option>
                   </Select>
-                  <Button variant="dark" size="sm" className="h-10 flex-1" loading={busy === "balance_paid"} onClick={() => act("balance_paid", { mode }, "Balance marked paid")}>
+                  <Button variant="dark" size="sm" className="h-10 flex-1 min-h-11 md:min-h-0" loading={busy === "balance_paid"} onClick={() => act("balance_paid", { mode }, "Balance marked paid")}>
                     Mark balance {inr(b.balanceAmount)} paid
                   </Button>
                 </div>
               )}
               {["CONFIRMED", "COMPLETED", "NO_SHOW"].includes(b.status) && started && (
                 <div className="flex gap-2">
-                  {b.status !== "COMPLETED" && <Button variant="light" size="sm" loading={busy === "complete"} onClick={() => act("complete", {}, "Marked completed")}>Mark completed</Button>}
-                  {b.status !== "NO_SHOW" && <Button variant="light" size="sm" loading={busy === "no_show"} onClick={() => act("no_show", {}, "Marked no-show")}>Mark no-show</Button>}
+                  {b.status !== "COMPLETED" && <Button variant="light" size="sm" className="min-h-11 md:min-h-0" loading={busy === "complete"} onClick={() => act("complete", {}, "Marked completed")}>Mark completed</Button>}
+                  {b.status !== "NO_SHOW" && <Button variant="light" size="sm" className="min-h-11 md:min-h-0" loading={busy === "no_show"} onClick={() => act("no_show", {}, "Marked no-show")}>Mark no-show</Button>}
                 </div>
               )}
               {b.status === "CONFIRMED" && d.customer.whatsappOptIn && (
-                <Button variant="light" size="sm" loading={busy === "resend"} onClick={() => act("resend", {}, "Confirmation queued on WhatsApp")}>Resend WhatsApp confirmation</Button>
+                <Button variant="light" size="sm" className="min-h-11 md:min-h-0" loading={busy === "resend"} onClick={() => act("resend", {}, "Confirmation queued on WhatsApp")}>Resend WhatsApp confirmation</Button>
               )}
               {["CONFIRMED", "PENDING_PAYMENT"].includes(b.status) && !cancelOpen && (
-                <Button variant="danger" size="sm" onClick={() => setCancelOpen(true)}>Cancel booking…</Button>
+                <Button variant="danger" size="sm" className="min-h-11 md:min-h-0" onClick={() => setCancelOpen(true)}>Cancel booking…</Button>
               )}
               {cancelOpen && (
                 <form
@@ -167,8 +167,8 @@ export function BookingDrawer({ id, onClose, role }: { id: string | null; onClos
                     <Input id="reason" value={reason} onChange={(e) => setReason(e.target.value)} maxLength={300} className="h-10" placeholder="e.g. Rain — ground unplayable" />
                   </div>
                   <div className="flex gap-2">
-                    <Button type="submit" variant="danger" size="sm" loading={busy === "cancel"}>Confirm cancel</Button>
-                    <Button type="button" variant="light" size="sm" onClick={() => setCancelOpen(false)}>Back</Button>
+                    <Button type="submit" variant="danger" size="sm" className="min-h-11 md:min-h-0" loading={busy === "cancel"}>Confirm cancel</Button>
+                    <Button type="button" variant="light" size="sm" className="min-h-11 md:min-h-0" onClick={() => setCancelOpen(false)}>Back</Button>
                   </div>
                 </form>
               )}
@@ -184,7 +184,7 @@ export function BookingDrawer({ id, onClose, role }: { id: string | null; onClos
                     <Label htmlFor="r2">Refund (max {inr(d.paid)})</Label>
                     <Input id="r2" type="number" min={1} max={d.paid} value={refundAmt} onChange={(e) => setRefundAmt(e.target.value)} required className="h-10" />
                   </div>
-                  <Button type="submit" variant="dark" size="sm" className="h-10" loading={busy === "refund"}>Refund</Button>
+                  <Button type="submit" variant="dark" size="sm" className="h-10 min-h-11 md:min-h-0" loading={busy === "refund"}>Refund</Button>
                 </form>
               )}
             </div>

@@ -13,7 +13,7 @@ function Num({ f, id, label, min, max, hint }: { f: (k: keyof S) => object; id: 
   return (
     <div>
       <Label htmlFor={`s-${id}`}>{label}</Label>
-      <Input type="number" min={min} max={max} {...f(id)} className="h-10" />
+      <Input type="number" min={min} max={max} {...f(id)} className="h-10 min-h-11 md:min-h-0" />
       {hint && <p className="mt-1 text-xs text-zinc-500">{hint}</p>}
     </div>
   );
@@ -71,7 +71,7 @@ export function SettingsForm({
         <legend className="px-1 text-sm font-bold uppercase tracking-wider text-zinc-500">Booking rules</legend>
         <div>
           <Label htmlFor="s-advanceType">Advance type</Label>
-          <Select {...f("advanceType")} className="h-10 text-sm">
+          <Select {...f("advanceType")} className="h-10 min-h-11 md:min-h-0 text-sm">
             <option value="FIXED">Fixed amount (₹)</option>
             <option value="PERCENT">Percent of total</option>
           </Select>
@@ -82,7 +82,7 @@ export function SettingsForm({
         <Num f={f} id="newCustomerDiscountPercent" label="New customer offer (% off, 0 = off)" min={0} max={50} />
         <div className="col-span-2">
           <Label htmlFor="s-ownerAlertPhone">Owner alert WhatsApp number (10 digits, blank to disable)</Label>
-          <Input type="tel" inputMode="numeric" {...f("ownerAlertPhone")} className="h-10" />
+          <Input type="tel" inputMode="numeric" {...f("ownerAlertPhone")} className="h-10 min-h-11 md:min-h-0" />
         </div>
       </fieldset>
 
@@ -108,7 +108,7 @@ export function SettingsForm({
             <Label htmlFor="boost">Raise today&apos;s OTP limits by</Label>
             <Input id="boost" type="number" min={1} max={10000} value={boost} onChange={(e) => setBoost(e.target.value)} className="h-10 w-28" />
           </div>
-          <Button type="button" variant="dark" size="sm" className="h-10" onClick={raiseCap} data-testid="raise-cap">Raise today&apos;s limits</Button>
+          <Button type="button" variant="dark" size="sm" className="h-10 min-h-11 md:min-h-0" onClick={raiseCap} data-testid="raise-cap">Raise today&apos;s limits</Button>
           {boostMsg && <p className="w-full text-xs text-zinc-600" role="status">{boostMsg}</p>}
         </div>
         <p className="col-span-2 text-xs font-semibold text-zinc-600">Per network (mobile carriers share IPs — keep these loose):</p>
@@ -122,19 +122,19 @@ export function SettingsForm({
         <legend className="px-1 text-sm font-bold uppercase tracking-wider text-zinc-500">Business info</legend>
         <div>
           <Label htmlFor="s-businessName">Business name</Label>
-          <Input {...f("businessName")} className="h-10" />
+          <Input {...f("businessName")} className="h-10 min-h-11 md:min-h-0" />
         </div>
         <div>
           <Label htmlFor="s-address">Address</Label>
-          <Input {...f("address")} className="h-10" />
+          <Input {...f("address")} className="h-10 min-h-11 md:min-h-0" />
         </div>
         <div>
           <Label htmlFor="s-mapLink">Google Maps link</Label>
-          <Input type="url" {...f("mapLink")} className="h-10" />
+          <Input type="url" {...f("mapLink")} className="h-10 min-h-11 md:min-h-0" />
         </div>
         <div>
           <Label htmlFor="s-phone">Contact phone (10 digits)</Label>
-          <Input type="tel" inputMode="numeric" {...f("phone")} className="h-10" />
+          <Input type="tel" inputMode="numeric" {...f("phone")} className="h-10 min-h-11 md:min-h-0" />
         </div>
         <div className="rounded-xl bg-zinc-50 p-3 text-xs text-zinc-600">
           Providers (set by environment variables): payments <strong>{providers.payment}</strong> · WhatsApp <strong>{providers.messaging}</strong> · OTP <strong>{providers.otp}</strong> · demo mode <strong>{providers.demo ? "on" : "off"}</strong>

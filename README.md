@@ -104,6 +104,7 @@ E2E covers: home → book → OTP → pay → confirmation; payment failure → 
 - **Prices** are computed on the server from `PricingRule` + `Holiday` + `Settings`; the client only sends court, date and times.
 - **Times** are stored as UTC `timestamptz`; IST conversion is a fixed +05:30 offset (India has no DST), see [`lib/time.ts`](lib/time.ts).
 - **OTP:** 6 digits, stored as HMAC (bound to the phone), 5-minute expiry, single use, 5 attempts, constant-time compare; 3 sends / phone / 15 min; per-IP limits and separate daily caps for new and returning numbers are set in **Admin → Settings**. A phone verified on a device stays trusted there for 90 days (no new code), until the customer is blocked or the owner signs out their devices.
+- **Refund cancels** always need a code typed in the last 10 minutes, even on a remembered device; cancels with nothing to refund don't.
 - **Cancellation and refunds** come from one place — **Admin → Settings → Cancellation & refunds** — and every page and WhatsApp message reads it ([`lib/policy.ts`](lib/policy.ts)).
 - **Messages** are written to `MessageLog` first, then delivered in the background with 3 attempts and exponential backoff. Delivery failures never affect the booking. Dedupe keys make enqueueing idempotent.
 
@@ -142,6 +143,7 @@ See [SECURITY_REPORT.md](SECURITY_REPORT.md) for the full review: findings, fixe
 ## Admin accounts
 
 - **Two-step login:** after the password, a 6-digit code goes to the admin's phone (WhatsApp, SMS fallback). "Trust this device" skips it for 30 days; changing or resetting the password revokes every trusted device and session.
+- **Recovery codes:** at the first two-step login each admin gets 10 one-time codes (shown once — save them). If the phone is lost, "Use a recovery code" on the login screen works instead of the SMS code; the owner is alerted each time. Make a new set in My account.
 - **Forgot password** (`/admin/forgot`): a reset code goes to the registered phone; the page answers the same whether or not the email exists.
 - **Team** (owner only, `/admin/team`): add staff with a temporary password (they must change it at first login), reset passwords, disable/enable, set phones.
 - **My account** (`/admin/account`): change your password and phone.

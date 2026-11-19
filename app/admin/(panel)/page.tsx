@@ -20,7 +20,7 @@ export default async function OverviewPage() {
   return (
     <>
       <PageHeader title="Overview">
-        <Link href="/admin/walk-in" className="rounded-full bg-ink px-4 py-2 text-sm font-bold text-flood">+ Walk-in booking</Link>
+        <Link href="/admin/walk-in" className="inline-flex min-h-11 items-center rounded-full bg-ink px-4 text-sm font-bold text-flood md:min-h-0 md:py-2">+ Walk-in booking</Link>
       </PageHeader>
 
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">

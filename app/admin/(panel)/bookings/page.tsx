@@ -26,8 +26,8 @@ export default async function BookingsPage({ searchParams }: { searchParams: Pro
   return (
     <>
       <PageHeader title="Bookings">
-        {admin.role === "OWNER" && <a href={`/api/admin/bookings/export${exportQs ? `?${exportQs}` : ""}`} className="rounded-full border border-zinc-300 bg-white px-4 py-2 text-sm font-bold">Export CSV</a>}
-        <Link href="/admin/walk-in" className="rounded-full bg-ink px-4 py-2 text-sm font-bold text-flood">+ Walk-in</Link>
+        {admin.role === "OWNER" && <a href={`/api/admin/bookings/export${exportQs ? `?${exportQs}` : ""}`} className="inline-flex min-h-11 items-center rounded-full border border-zinc-300 bg-white px-4 text-sm font-bold md:min-h-0 md:py-2">Export CSV</a>}
+        <Link href="/admin/walk-in" className="inline-flex min-h-11 items-center rounded-full bg-ink px-4 text-sm font-bold text-flood md:min-h-0 md:py-2">+ Walk-in</Link>
       </PageHeader>
       {sp.denied && <Alert tone="warn" className="mb-4">That page is for the owner only.</Alert>}
 
@@ -73,8 +73,8 @@ export default async function BookingsPage({ searchParams }: { searchParams: Pro
       <nav aria-label="Pagination" className="mt-4 flex items-center justify-between text-sm">
         <span className="text-zinc-500">{total} booking{total === 1 ? "" : "s"} · page {page} of {pages}</span>
         <div className="flex gap-2">
-          {page > 1 && <Link className="rounded-lg border border-zinc-300 bg-white px-3 py-1.5 font-semibold" href={`?${qs({ page: page - 1 })}`}>← Prev</Link>}
-          {page < pages && <Link className="rounded-lg border border-zinc-300 bg-white px-3 py-1.5 font-semibold" href={`?${qs({ page: page + 1 })}`}>Next →</Link>}
+          {page > 1 && <Link className="inline-flex min-h-11 items-center rounded-lg border border-zinc-300 bg-white px-4 font-semibold md:min-h-0 md:py-1.5" href={`?${qs({ page: page - 1 })}`}>← Prev</Link>}
+          {page < pages && <Link className="inline-flex min-h-11 items-center rounded-lg border border-zinc-300 bg-white px-4 font-semibold md:min-h-0 md:py-1.5" href={`?${qs({ page: page + 1 })}`}>Next →</Link>}
         </div>
       </nav>
     </>

@@ -7,7 +7,10 @@ import { Alert } from "@/components/ui/field";
 import { OtpVerify } from "@/components/booking/otp-verify";
 import { api, ApiError, inr } from "@/lib/utils";
 
-/** Cancel button for the booking page. Asks for OTP first if this browser hasn't verified the owner's phone. */
+/**
+ * Cancel button for the booking page. Asks for an OTP first if this browser hasn't verified the owner's
+ * phone. A cancel that refunds money always asks for a new code, even on a remembered device. [SEC-43]
+ */
 export function CancelBooking({
   bookingCode,
   refund,
@@ -29,6 +32,7 @@ export function CancelBooking({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<string | null>(null);
+  const [needFresh, setNeedFresh] = useState(refund > 0);
 
   const cancel = async () => {
     setBusy(true);
@@ -45,7 +49,10 @@ export function CancelBooking({
       setStage("done");
       router.refresh();
     } catch (e) {
-      if (e instanceof ApiError && (e.code === "PHONE_NOT_VERIFIED" || e.code === "FORBIDDEN")) setStage("otp");
+      if (e instanceof ApiError && (e.code === "PHONE_NOT_VERIFIED" || e.code === "FORBIDDEN" || e.code === "FRESH_OTP_REQUIRED")) {
+        if (e.code === "FRESH_OTP_REQUIRED") setNeedFresh(true);
+        setStage("otp");
+      }
       setError((e as Error).message);
     } finally {
       setBusy(false);
@@ -68,14 +75,16 @@ export function CancelBooking({
               : "This booking has no online payment to refund."}
       </p>
       {stage === "idle" && canCancel && (
-        <Button variant="light" className="mt-4" onClick={() => setStage(verified ? "confirm" : "otp")}>
+        <Button variant="light" className="mt-4" onClick={() => setStage(verified && !needFresh ? "confirm" : "otp")}>
           Cancel booking
         </Button>
       )}
       {stage === "otp" && (
         <div className="mt-4">
-          <p className="mb-2 text-sm font-semibold">First, confirm it&apos;s you.</p>
-          <OtpVerify target={{ bookingCode }} onVerified={() => setStage("confirm")} />
+          <p className="mb-2 text-sm font-semibold">
+            {needFresh ? "To send your refund, confirm it's you with a new code." : "First, confirm it’s you."}
+          </p>
+          <OtpVerify target={{ bookingCode }} fresh={needFresh} onVerified={() => { setError(null); setStage("confirm"); }} />
         </div>
       )}
       {stage === "confirm" && (

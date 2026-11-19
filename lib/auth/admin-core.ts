@@ -4,6 +4,7 @@
  */
 import "server-only";
 import bcrypt from "bcryptjs";
+import { randomInt } from "node:crypto";
 import { and, desc, eq, isNull, ne } from "drizzle-orm";
 import { getDb, schema } from "@/db/client";
 import { env } from "@/lib/env";
@@ -183,4 +184,98 @@ export async function manageStaff(id: string, action: { type: "reset_password"; 
       break;
   }
   await audit(db, { actor, action: `admin.staff_${action.type}`, entity: "AdminUser", entityId: id, after: { email: u.email } });
+}
+
+// ── 2FA recovery codes [SEC-41] ──
+// 10 single-use codes like "K7QD2-M9XPA" for when the admin's phone is lost. Only an HMAC (keyed with
+// APP_SECRET, bound to the admin) is stored, so a database leak alone doesn't reveal usable codes.
+
+export const RECOVERY_CODE_COUNT = 10;
+const RECOVERY_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"; // no 0/O, 1/I/L
+const recoveryHash = (adminId: string, code: string) => hmacHex(env.appSecret, `admin:recovery:${adminId}:${code}`);
+
+/** Uppercases and strips spaces/dashes; null if it can't be a recovery code. */
+export function normalizeRecoveryCode(input: string): string | null {
+  const c = input.toUpperCase().replace(/[\s-]/g, "");
+  return c.length === 10 && [...c].every((ch) => RECOVERY_ALPHABET.includes(ch)) ? c : null;
+}
+
+function newRecoveryCode() {
+  // randomInt is uniform (no modulo bias): 31^10 ≈ 2^49.5 possibilities per code.
+  const raw = Array.from({ length: 10 }, () => RECOVERY_ALPHABET[randomInt(RECOVERY_ALPHABET.length)]).join("");
+  return `${raw.slice(0, 5)}-${raw.slice(5)}`;
+}
+
+/** Makes a new set of 10 codes and deletes every older one. Returns the codes — the only time they're visible. */
+export async function generateRecoveryCodes(adminId: string, actor: string, reason: "setup" | "regenerate", now = new Date()) {
+  const db = await getDb();
+  const codes = Array.from({ length: RECOVERY_CODE_COUNT }, newRecoveryCode);
+  await db.transaction(async (tx) => {
+    await tx.delete(schema.adminRecoveryCodes).where(eq(schema.adminRecoveryCodes.adminId, adminId));
+    await tx.insert(schema.adminRecoveryCodes).values(codes.map((c) => ({ adminId, codeHash: recoveryHash(adminId, normalizeRecoveryCode(c)!), createdAt: now })));
+    await tx.update(schema.adminUsers).set({ recoveryCodesAt: now }).where(eq(schema.adminUsers.id, adminId));
+    await audit(tx, { actor, action: reason === "setup" ? "admin.recovery_codes_created" : "admin.recovery_codes_regenerated", entity: "AdminUser", entityId: adminId, after: { count: codes.length } });
+  });
+  return codes;
+}
+
+/** If this admin has never had recovery codes (first two-step login), makes them now. */
+export async function ensureRecoveryCodes(admin: Pick<AdminUser, "id" | "email" | "recoveryCodesAt">, now = new Date()) {
+  if (admin.recoveryCodesAt) return undefined;
+  const db = await getDb();
+  // Claim the "first set" atomically so two parallel logins can't make two sets.
+  const claimed = await db
+    .update(schema.adminUsers)
+    .set({ recoveryCodesAt: now })
+    .where(and(eq(schema.adminUsers.id, admin.id), isNull(schema.adminUsers.recoveryCodesAt)))
+    .returning({ id: schema.adminUsers.id });
+  if (!claimed.length) return undefined;
+  return generateRecoveryCodes(admin.id, admin.email, "setup", now);
+}
+
+export async function recoveryCodesLeft(adminId: string) {
+  const db = await getDb();
+  const rows = await db
+    .select({ id: schema.adminRecoveryCodes.id })
+    .from(schema.adminRecoveryCodes)
+    .where(and(eq(schema.adminRecoveryCodes.adminId, adminId), isNull(schema.adminRecoveryCodes.usedAt)));
+  return rows.length;
+}
+
+/**
+ * Login step 2 with a recovery code instead of the phone code. Needs the same password-checked
+ * challenge (so a code alone can't log anyone in), counts against the challenge's 5 tries, and each
+ * code works once. The owner is alerted every time one is used.
+ */
+export async function verifyRecoveryLogin(challengeId: string, input: string, now = new Date()) {
+  const db = await getDb();
+  const invalid = new AppError("OTP_INVALID", "That recovery code is wrong or already used.");
+  const [rec] = await db.select().from(schema.adminCodes).where(and(eq(schema.adminCodes.id, challengeId), eq(schema.adminCodes.purpose, "LOGIN")));
+  if (!rec || rec.consumedAt || rec.expiresAt <= now) throw new AppError("OTP_INVALID", "This sign-in has expired. Enter your password again.");
+  if (rec.attempts >= CODE_MAX_ATTEMPTS) throw new AppError("OTP_LOCKED", "Too many wrong codes. Enter your password again.");
+  const counted = await db
+    .update(schema.adminCodes)
+    .set({ attempts: rec.attempts + 1 })
+    .where(and(eq(schema.adminCodes.id, rec.id), eq(schema.adminCodes.attempts, rec.attempts), isNull(schema.adminCodes.consumedAt)))
+    .returning({ id: schema.adminCodes.id });
+  if (!counted.length) throw invalid;
+  const code = normalizeRecoveryCode(input);
+  if (!code) throw invalid;
+  const used = await db
+    .update(schema.adminRecoveryCodes)
+    .set({ usedAt: now })
+    .where(and(eq(schema.adminRecoveryCodes.adminId, rec.adminId), eq(schema.adminRecoveryCodes.codeHash, recoveryHash(rec.adminId, code)), isNull(schema.adminRecoveryCodes.usedAt)))
+    .returning({ id: schema.adminRecoveryCodes.id });
+  if (!used.length) throw invalid;
+  await db.update(schema.adminCodes).set({ consumedAt: now }).where(eq(schema.adminCodes.id, rec.id));
+  const [admin] = await db.select().from(schema.adminUsers).where(eq(schema.adminUsers.id, rec.adminId));
+  if (!admin || !admin.isActive) throw invalid;
+  const left = await recoveryCodesLeft(admin.id);
+  await audit(db, { actor: admin.email, action: "admin.recovery_code_used", entity: "AdminUser", entityId: admin.id, after: { left, ip: rec.ip } });
+  void alertOwner(
+    `recovery_${admin.id}_${now.getTime()}`,
+    `A recovery code was used to sign in as ${admin.email} (${left} left). If this wasn't expected, disable the account and check the audit log.`,
+    now,
+  );
+  return { admin, left };
 }

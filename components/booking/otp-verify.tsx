@@ -18,12 +18,15 @@ export function OtpVerify({
   onChangeNumber,
   autoSend = true,
   tone = "light",
+  fresh = false,
 }: {
   target: Target;
   onVerified: (maskedPhone: string) => void;
   onChangeNumber?: () => void;
   autoSend?: boolean;
   tone?: "light" | "dark";
+  /** Always send a real code, even on a remembered device (used before a refund). */
+  fresh?: boolean;
 }) {
   const [digits, setDigits] = useState<string[]>(Array(6).fill(""));
   const [sent, setSent] = useState<SendRes | null>(null);
@@ -65,7 +68,7 @@ export function OtpVerify({
     setSending(true);
     setError(null);
     try {
-      const r = await api<SendRes>("/api/otp/send", { method: "POST", json: { ...JSON.parse(targetKey), turnstileToken: captcha ?? undefined } });
+      const r = await api<SendRes>("/api/otp/send", { method: "POST", json: { ...JSON.parse(targetKey), turnstileToken: captcha ?? undefined, ...(fresh ? { fresh: true } : {}) } });
       if (r.trusted) {
         // This phone was verified on this device before: no code needed.
         onVerified(r.maskedPhone);

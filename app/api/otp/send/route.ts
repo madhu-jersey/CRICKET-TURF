@@ -11,6 +11,8 @@ import { verifyTurnstile } from "@/lib/turnstile";
 import { checkTrustToken, readTrustCookie } from "@/lib/auth/trusted-device";
 
 const turnstileField = z.object({ turnstileToken: z.string().max(2048).optional() });
+// fresh: true = the customer is about to do something that moves money (refund cancel), so always send a real code. [SEC-43]
+const freshField = z.object({ fresh: z.boolean().optional() });
 
 export const POST = handle(async (req: Request) => {
   const raw = await readJson(req);
@@ -24,8 +26,8 @@ export const POST = handle(async (req: Request) => {
     phone = d.customer.phone;
   }
   // Trusted device for this exact number: verify without sending (no cost, no cap). [SEC-35]
-  if (await checkTrustToken(await readTrustCookie(), phone)) {
-    await setPhoneCookie(phone);
+  if (!freshField.parse(raw).fresh && (await checkTrustToken(await readTrustCookie(), phone))) {
+    await setPhoneCookie(phone, "trusted");
     return NextResponse.json({ ok: true, trusted: true, maskedPhone: maskPhone(phone) });
   }
   // Bot check before any limit is touched (required on live sites). [SEC-09][SEC-34]

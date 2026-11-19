@@ -2,7 +2,7 @@
 
 **Scope:** full codebase review + testing of the Next.js turf booking site (box cricket + pickleball): public booking with phone OTP, ₹ advance payment (Razorpay / mock), WhatsApp messaging, owner/staff dashboard.
 **Environment:** local only — embedded Postgres (PGlite, real Postgres 17 with the real migrations), mock OTP / WhatsApp / payment providers, isolated production build on `localhost:3100`. No production systems, real payment accounts or real phone numbers were used.
-**Date:** 18 Nov 2026 · **Version tested:** `main` + the fixes in this report. **Follow-up round (SEC-33 → SEC-40):** same day, branch `security-review`; real Postgres 17 (embedded, 25 connections) added for race testing.
+**Date:** 18 Nov 2026 · **Version tested:** `main` + the fixes in this report. **Follow-up round (SEC-33 → SEC-40):** same day, branch `security-review`; real Postgres 17 (embedded, 25 connections) added for race testing. **Third round (SEC-41 → SEC-43):** 19 Nov 2026 — admin recovery codes, admin pages tested on a phone screen, fresh code for refund cancels.
 
 > Note: this site **keeps online advance payment** (owner decision), so the review covers both the "no payment" checklist (booking abuse, OTP flooding, access control) and the payment checks (fake/forged/replayed payments, refunds).
 
@@ -14,15 +14,15 @@
 |---|---|---|---|---|
 | Critical | 1 | 1 | – | – |
 | High | 7 | 7 | – | – |
-| Medium | 13 | 13 | – | – |
-| Low | 10 | 9 | 1 | – |
+| Medium | 15 | 15 | – | – |
+| Low | 11 | 10 | 1 | – |
 | Info | – | – | 3 | 1 (Supabase RLS, if used) |
 
-Counts include the follow-up round (SEC-33 → SEC-40). Turnstile is no longer "needs owner action": a live server now refuses to start without it.
+Counts include the follow-up rounds (SEC-33 → SEC-43). Turnstile is no longer "needs owner action": a live server now refuses to start without it.
 
 **Overall risk after fixes: Low.** Every Critical, High and Medium issue is fixed and covered by an automated test. The code is **safe to go live once the go-live checklist (§5) is done**. The new startup check refuses to run a live (`DEMO_MODE=false`) server until the critical items are set.
 
-**Tests (after the follow-up round):** 110 Vitest tests on PGlite (+8 race tests skipped there), **118/118 on real Postgres 17** (`npm run test:realdb`), **8/8 race tests** with 25 truly parallel connections (`npm run test:concurrency`), 22 Playwright browser/HTTP tests (desktop + mobile; 12 desktop-only tests skipped on mobile). All pass. `npm audit`: 0 vulnerabilities (production and dev).
+**Tests (after the third round, 19 Nov 2026):** 121 Vitest tests on PGlite (+8 race tests skipped there), **129/129 on real Postgres 17** (`npm run test:realdb`), **8/8 race tests** with 25 truly parallel connections (`npm run test:concurrency`), **32 Playwright tests** (desktop + mobile; the admin schedule, walk-in, bookings list and settings tests now run on both; 14 desktop-only tests skipped on mobile). All pass. `npm audit --omit=dev`: 0 vulnerabilities.
 
 The most important findings were:
 - **SEC-01 (Critical):** on a live site where `PAYMENT_PROVIDER` wasn't set, the demo "Simulate success" checkout still worked, so **anyone could book for free**.
@@ -230,6 +230,23 @@ Razorpay Orders/Refunds API · WhatsApp Cloud API or BSP · MSG91 SMS · Cloudfl
 - **Fix:** one source — Settings (`cancelCutoffHours`, `refundCutoffHours`, `refundPercentBeforeCutoff`, `refundPercentAfterCutoff`) → `lib/policy.ts` → `/refund-policy`, FAQ, booking form, booking status/cancel page, `booking_confirmed` and `booking_cancelled` messages, and the server-side refund calculation.
 - **Tests:** `followup.test.ts › SEC-40` (wording from Settings; a grep test fails if cutoff hours or refund percentages are hardcoded), `http.spec.ts › SEC-40` (change Settings → every page shows the new rule, then restored).
 
+### Third round (SEC-41 → SEC-43)
+
+### SEC-41 — Losing the phone locked an admin out of two-step login · **Medium** · Fixed
+- **Proof:** with 2FA on (SEC-39), an admin whose phone was lost, stolen or out of credit had no way in except the owner editing the database; for the owner themselves there was no way at all.
+- **Fix:** 10 single-use recovery codes per admin (format `ABCDE-FGHJK`, 31-character alphabet without look-alikes, `crypto.randomInt` so no bias; ~49.5 bits each). Made at the admin's first two-step login (claimed atomically so two parallel logins can't make two sets) and **shown once**, with copy/download and an "I've saved them" step. Stored only as HMAC-SHA256 keyed with `APP_SECRET` and bound to the admin, so a database leak alone doesn't give usable codes. A code works only on a live password-checked login challenge (so a code alone can't log anyone in), counts against that challenge's 5 tries, works once (atomic `UPDATE … WHERE usedAt IS NULL`), and never trusts the device. **My account → Recovery codes** shows how many are left and makes a new set (current password required; every old code is deleted). Every creation, regeneration and use is audit-logged; each use sends the owner a WhatsApp alert naming the account and the number of codes left.
+- **Tests:** `tests/security/recovery-refund.test.ts › SEC-41` (10 distinct codes, no plaintext stored, one set under parallel first logins, single use, A's code can't finish B's login, needs a live challenge, locks after 5 tries, regenerate replaces all, audit + owner alert); `http.spec.ts › SEC-41` (codes returned at first 2FA login only, recovery login works and doesn't trust the device, reuse refused, regenerate needs the password and old codes stop working); the new route is in the `SEC-14` access-control list.
+
+### SEC-42 — Admin pages were only tested on desktop; several controls were too small to tap · **Low** · Fixed
+- **Proof:** running the admin tests on the mobile project (Pixel 7) with a check for sideways scrolling and tap targets under 44×44 px found: schedule toolbar buttons and date picker 32–36 px tall, the slot sheet's Close link ~20 px, walk-in radio buttons and checkbox 13×13 px, the "View" link after a walk-in 39 px wide, bookings-page Export / + Walk-in / paging links 34–38 px tall, booking-drawer buttons and inputs 36–40 px, the settings "Raise today's limits" button 40 px. (Not a security hole, but staff at the ground mis-tapping booking and refund controls is an operational risk.)
+- **Fix:** all of those are at least 44 px on phones (desktop sizes unchanged); radios/checkboxes use their whole label as the target. The schedule test also exposed a race in the test itself (clicking a booking while the page was still changing day), fixed by waiting for the URL.
+- **Tests:** `tests/e2e/admin-panels.spec.ts` — schedule (move days, open a booking), walk-in, bookings list (search, open the drawer) and settings (save, reload, restore) on **desktop and mobile**; on mobile every page and drawer must have no sideways scroll and no interactive element under 44×44 px (inline text links exempt, as in WCAG 2.5.8).
+
+### SEC-43 — A remembered device was enough to cancel and take a refund · **Medium** · Fixed
+- **Proof:** after SEC-35, anyone holding a customer's unlocked phone/browser for 90 days could cancel a paid booking and trigger a refund without a new code.
+- **Fix:** the verified-phone cookie now records how the phone was verified (`otp` or `trusted`) and when. A customer cancel that would refund money needs a code typed in the last **10 minutes**; otherwise the server answers `FRESH_OTP_REQUIRED` and nothing changes. "Send code" with `fresh: true` skips the remembered-device shortcut. The check runs in the route (before the 3-cancels-a-day counter, so a refused try doesn't use one up) and again inside the locked cancel transaction, using the exact refund that would be paid. Cancels with nothing to refund (inside the cutoff, or nothing paid online) behave as before. Old cookies without the new fields count as "not fresh". The cancel screen asks for a new code whenever a refund is due. Staff/owner cancels are unchanged.
+- **Tests:** `recovery-refund.test.ts › SEC-43` (refused without a fresh code with no change to booking or payment; works with one; no-refund cancels unaffected; admin cancels unaffected; 10-minute window; legacy tokens); `http.spec.ts › SEC-43` (remembered device → 401 `FRESH_OTP_REQUIRED`, booking still confirmed; fresh code → refund; walk-in with no online payment → cancel works on the remembered device); `booking.spec.ts › cancel with refund` (the browser flow now asks for a new code).
+
 ### SEC-28 — Dev dependency advisory (picomatch ReDoS via vitest) · **Low** · Fixed (resolved upstream)
 - Earlier: 5 high advisories in `picomatch` inside the test runner. Re-checked 18 Nov 2026: `npm audit` and `npm audit --omit=dev` both report **0 vulnerabilities**. CI now fails on any high advisory in production dependencies.
 
@@ -285,6 +302,7 @@ Razorpay Orders/Refunds API · WhatsApp Cloud API or BSP · MSG91 SMS · Cloudfl
 - [ ] **Turnstile keys** set — **required** (the server refuses to start without them); `TURNSTILE_HOSTNAMES` = the live domain
 - [ ] **Owner phone** set (login codes and password resets go there — startup check)
 - [ ] **Admin 2FA on** (`ADMIN_2FA_REQUIRED` unset or `true`; the server warns if it is off)
+- [ ] **Every admin has saved their recovery codes** (My account shows how many are left); the owner's alert number is set so recovery-code use is reported
 - [ ] **Split OTP caps** reviewed (new 200 / returning 300 per day) and **per-IP limits** reviewed (OTP send 30/h, verify 60/h, booking 60/h, cancel 30/h)
 - [ ] **Cancellation & refund settings** confirmed by the owner (they drive every page and message)
 - [ ] **CI green** on the release commit (`.github/workflows/security.yml`)
@@ -308,6 +326,8 @@ Razorpay Orders/Refunds API · WhatsApp Cloud API or BSP · MSG91 SMS · Cloudfl
 - **Admin login codes and password-reset codes on real WhatsApp/SMS:** only the mock provider was used. Delivery, the SMS fallback and the masked phone shown on screen need checking on staging (smoke test §6).
 - **Turnstile on a real domain:** the hostname/action check is unit-tested against Cloudflare's documented response; it hasn't been tried with real keys.
 - **Staging smoke test:** written (`scripts/staging-smoke.md` + read-only `scripts/staging-smoke.mjs`) but **not run**, as instructed.
+- **Recovery codes in real life:** whether admins actually store them safely can't be tested; the go-live checklist asks the owner to check. Codes are 10 characters (~49.5 bits) and need the password first, so they are not rate limited beyond the 5 tries per login and 30 per IP per 15 minutes.
+- **Tap targets:** checked automatically at one phone size (Pixel 7, 412 px wide) on the four admin pages named in the request. Other admin pages (pricing, courts, gallery, team, audit log) were not part of this pass.
 - **Upstash limiter store:** code path written; only the Postgres store was tested (no Upstash account).
 
 ---
@@ -316,9 +336,9 @@ Razorpay Orders/Refunds API · WhatsApp Cloud API or BSP · MSG91 SMS · Cloudfl
 
 | Job | What it does | Fails the build when | Local result |
 |---|---|---|---|
-| unit | `npm ci`, typecheck, `npm test` (PGlite) | any test fails | 110 passed, 8 skipped |
-| concurrency | `postgres:17` service; `npm run test:concurrency` and `npm run test:realdb` | any test fails | 8/8 and 118/118 (embedded Postgres 17) |
-| e2e | Playwright desktop + mobile, incl. HTTP security specs | any test fails | 22 passed, 12 skipped (desktop-only) |
+| unit | `npm ci`, typecheck, `npm test` (PGlite) | any test fails | 121 passed, 8 skipped |
+| concurrency | `postgres:17` service; `npm run test:concurrency` and `npm run test:realdb` | any test fails | 8/8 and 129/129 (embedded Postgres 17) |
+| e2e | Playwright desktop + mobile, incl. HTTP security specs | any test fails | 32 passed, 14 skipped (desktop-only) |
 | secrets | gitleaks over the full history (`fetch-depth: 0`) | any leak found | not run locally; regex scan: 0 hits |
 | sast | semgrep `p/nextjs p/typescript p/secrets p/owasp-top-ten` | any ERROR finding | not run locally |
 | audit | `npm audit --omit=dev --audit-level=high` | high/critical advisory | 0 vulnerabilities |

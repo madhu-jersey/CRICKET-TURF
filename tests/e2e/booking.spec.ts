@@ -37,6 +37,10 @@ test("cancel with refund (more than 2 hours ahead)", async ({ page }, info) => {
 
   await expect(page.getByText("Cancel now and get ₹300 back.")).toBeVisible();
   await page.getByRole("button", { name: "Cancel booking" }).click();
+  // Money back needs a new code, even though this phone was just verified on this device. [SEC-43]
+  await expect(page.getByText("To send your refund, confirm it's you with a new code.")).toBeVisible();
+  const otp = (await page.getByTestId("dev-otp-code").textContent())!.trim();
+  await page.getByLabel("Digit 1").fill(otp);
   await page.getByTestId("confirm-cancel").click();
   await expect(page.getByText(/₹300 will be refunded/)).toBeVisible();
   await page.reload();

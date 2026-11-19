@@ -110,7 +110,7 @@ describe.skipIf(!REAL)("real-Postgres races (parallel connections)", () => {
     await handlePaymentWebhook(body, webhookSignature(body, p.webhookSecret), "evt_race_c");
     const d = (await getBookingByCode(h.bookingCode))!;
     const { result: r, maxBusy } = await t.overlap(() =>
-      Promise.all(Array.from({ length: 5 }, () => outcome(cancelBooking({ bookingId: d.booking.id, actor: "c", by: "CUSTOMER", refund: { mode: "POLICY" } })))),
+      Promise.all(Array.from({ length: 5 }, () => outcome(cancelBooking({ bookingId: d.booking.id, actor: "c", by: "CUSTOMER", refund: { mode: "POLICY" }, freshOtp: true })))),
     );
     expect(tally(r)).toEqual({ OK: 1, NOT_ALLOWED: 4 });
     const after = (await getBookingByCode(h.bookingCode))!;
