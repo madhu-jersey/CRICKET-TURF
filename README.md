@@ -4,6 +4,7 @@ A complete booking site for a box-cricket + pickleball venue: public website, li
 
 - **Stack:** Next.js 16 (App Router) · TypeScript (strict) · Tailwind CSS v4 · Postgres + Drizzle ORM (raw SQL migrations) · Zod · Razorpay · Vitest · Playwright
 - **Branding:** everything lives in [`config/site.ts`](config/site.ts) (name, phone, address, map, images, FAQ, amenities).
+- **How it works:** [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) explains every flow, table, limit and setting, with diagrams. Check its file paths with `node scripts/check-doc-paths.mjs`.
 
 ## Quick start (zero setup)
 
@@ -71,6 +72,7 @@ npx playwright install chromium
 npm run test:e2e         # builds into .next-e2e, starts a fresh server on :3100, runs desktop + mobile
 npm run test:concurrency # race tests on REAL Postgres, 25 parallel connections
 npm run test:realdb      # every Vitest suite on real Postgres
+npm run release:check    # REQUIRED before every deploy: typecheck + test + test:realdb + test:concurrency + Playwright
 ```
 
 ### Concurrency tests on real Postgres
@@ -131,16 +133,55 @@ Set `MESSAGING_PROVIDER=bsp`, `BSP_API_URL`, `BSP_API_KEY` (and `BSP_AUTH_HEADER
 
 ## Deploying to Vercel
 
-1. Create a Supabase project, run `npm run db:migrate` against it (and `db:seed` if you want demo data).
-2. Import the repo in Vercel and add the environment variables (at least `DATABASE_URL`, `APP_SECRET`, `CRON_SECRET`, `NEXT_PUBLIC_SITE_URL`).
-3. [`vercel.json`](vercel.json) schedules `/api/cron/expire-holds` every minute and `/api/cron/send-reminders` every 15 minutes. Per-minute crons need a Vercel Pro plan; on Hobby, change the schedule to daily (or use Supabase `pg_cron` / an external pinger). Availability stays correct either way, because expired holds are always treated as free.
-4. Set `STORAGE_PROVIDER=supabase` + Supabase keys if you'd rather keep gallery uploads out of the database (create a **public** bucket named in `SUPABASE_BUCKET`).
+**Before every deploy:** `npm run release:check` must pass locally (typecheck, both database suites, races, Playwright). See [Tests](#tests).
+
+**Order: migrate → deploy.** A live server refuses to start if the database is missing a migration, and names the missing files.
+
+1. **Database.** Create a Supabase project (or any Postgres). Apply migrations with `DATABASE_URL=<url> npm run deploy:migrate` — it takes an advisory lock so two runs can't overlap, and never seeds. Or run the **migrate-production** GitHub Action (Actions → migrate-production → Run workflow, type `migrate production`); it uses the `PRODUCTION_DATABASE_URL` secret of the `production` environment ([`.github/workflows/migrate-production.yml`](.github/workflows/migrate-production.yml)). Never run `db:seed` on a live database.
+2. **Owner account** (with `DATABASE_URL` pointing at the live database):
+   - `npm run admin:create -- --email you@venue.in --name "Your Name" --phone +919812345678` — asks for the password without showing it (10+ characters, not common, not your email). Refuses if an active owner exists, unless `--force`.
+   - `npm run admin:remove-demo` — deactivates `owner@demo.com` and `staff@demo.com` if they exist.
+   - Sign in once: a login code goes to the phone, and 10 recovery codes are shown — save them.
+3. **Vercel.** Import the repo and add the environment variables (section above and [`.env.example`](.env.example)). Then deploy.
+4. **Scheduled jobs.** See [Scheduled jobs](#scheduled-jobs-crons) below.
+5. **Uptime.** Point an uptime monitor at `/api/health` (below).
+6. Set `STORAGE_PROVIDER=supabase` + Supabase keys if you'd rather keep gallery uploads out of the database (create a **public** bucket named in `SUPABASE_BUCKET`).
+
+### Scheduled jobs (crons)
+
+Two endpoints, both `GET` with header `Authorization: Bearer <CRON_SECRET>`:
+
+| Endpoint | What it does | Needed how often |
+|---|---|---|
+| `/api/cron/expire-holds` | Marks unpaid holds as expired | Optional — expired holds are already treated as free everywhere |
+| `/api/cron/send-reminders` | 2-hour reminders, stuck-message retry, refund reconcile/retry, cleanup | Every 15 min ideal; **hourly is fine** (a booking starting within 2 h without a reminder gets one on the next run) |
+
+Every job is safe to run late, early or twice. Pick one scheduler:
+
+- **Vercel Pro:** [`vercel.json`](vercel.json) already schedules both (every minute and every 15 minutes). Vercel Hobby is for non-commercial use and rejects schedules more frequent than daily — on Hobby, delete the `crons` block from `vercel.json` and use one of the options below.
+- **Supabase `pg_cron` + `pg_net`** (Database → Extensions → enable both), then in the SQL editor:
+  ```sql
+  select cron.schedule('bba-reminders', '*/15 * * * *', $
+    select net.http_get(
+      url := 'https://YOUR_DOMAIN/api/cron/send-reminders',
+      headers := jsonb_build_object('Authorization', 'Bearer YOUR_CRON_SECRET')
+    ) $);
+  ```
+  (Store the secret in Supabase Vault if you prefer not to keep it in the job text.)
+- **cron-job.org (free):** create a job for `https://YOUR_DOMAIN/api/cron/send-reminders`, every 15 minutes, request method GET, and under *Advanced → Headers* add `Authorization` = `Bearer YOUR_CRON_SECRET`. Optionally a second job for `/api/cron/expire-holds`.
+
+### Health check and error tracking
+
+- `GET /api/health` returns `ok` (200) when the database answers within 2 s, otherwise `unavailable` (503). It needs no auth and returns no data. **UptimeRobot (free):** Add New Monitor → HTTP(s) → URL `https://YOUR_DOMAIN/api/health` → interval 5 minutes → add your e-mail/phone as alert contact.
+- **Errors:** set `SENTRY_DSN` (optional) to send unexpected server errors to Sentry, with phone numbers and e-mails masked and no request bodies, headers or cookies. A live server prints a startup warning if it's not set.
 
 ## Security
 
 See [SECURITY_REPORT.md](SECURITY_REPORT.md) for the full review: findings, fixes, tests and what to set before launch. Security regression tests live in `tests/security/` (`npm run test:security`). On a live server (`NODE_ENV=production`, `DEMO_MODE=false`) the app **refuses to start** if demo admins, mock providers or missing secrets are still in place.
 
 ## Admin accounts
+
+- **Command-line tools** for the live database: `npm run admin:create`, `npm run admin:remove-demo`, `npm run admin:recover -- --email … [--phone +91…]` (see [Deploying](#deploying-to-vercel) and the runbook in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)).
 
 - **Two-step login:** after the password, a 6-digit code goes to the admin's phone (WhatsApp, SMS fallback). "Trust this device" skips it for 30 days; changing or resetting the password revokes every trusted device and session.
 - **Recovery codes:** at the first two-step login each admin gets 10 one-time codes (shown once — save them). If the phone is lost, "Use a recovery code" on the login screen works instead of the SMS code; the owner is alerted each time. Make a new set in My account.

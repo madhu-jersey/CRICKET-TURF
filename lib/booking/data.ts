@@ -25,6 +25,7 @@ export async function getSettings(q?: Queryable): Promise<SettingsRow> {
     maxActiveBookingsPerPhone: 2,
     maxBookingsPerPhonePerDay: 4,
     noShowBlockThreshold: 3,
+    autoCompleteHours: 6,
     otpDailyCapNew: 200,
     otpDailyCapReturning: 300,
     otpCapBoost: 0,

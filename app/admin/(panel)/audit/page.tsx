@@ -52,8 +52,8 @@ export default async function AuditPage({ searchParams }: { searchParams: Promis
       <nav className="mt-4 flex justify-between text-sm" aria-label="Pagination">
         <span className="text-zinc-500">{n} entries</span>
         <span className="flex gap-2">
-          {page > 1 && <Link className="rounded-lg border border-zinc-300 bg-white px-3 py-1" href={`?page=${page - 1}`}>← Newer</Link>}
-          {page * PAGE < n && <Link className="rounded-lg border border-zinc-300 bg-white px-3 py-1" href={`?page=${page + 1}`}>Older →</Link>}
+          {page > 1 && <Link className="inline-flex min-h-11 items-center rounded-lg border border-zinc-300 bg-white px-4 md:min-h-0 md:py-1" href={`?page=${page - 1}`}>← Newer</Link>}
+          {page * PAGE < n && <Link className="inline-flex min-h-11 items-center rounded-lg border border-zinc-300 bg-white px-4 md:min-h-0 md:py-1" href={`?page=${page + 1}`}>Older →</Link>}
         </span>
       </nav>
     </>

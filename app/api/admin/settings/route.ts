@@ -6,6 +6,7 @@ import { getDb, schema } from "@/db/client";
 import { getSettings } from "@/lib/booking/data";
 import { phoneSchema, sanitizeText } from "@/lib/validation";
 import { audit } from "@/lib/audit";
+import { invalidateAllAvailability, invalidateCourtConfig } from "@/lib/booking/availability-cache";
 
 const text = (max: number) => z.string().transform(sanitizeText).pipe(z.string().min(2).max(max));
 
@@ -23,6 +24,8 @@ const body = z
     maxActiveBookingsPerPhone: z.coerce.number().int().min(1).max(20),
     maxBookingsPerPhonePerDay: z.coerce.number().int().min(1).max(50),
     noShowBlockThreshold: z.coerce.number().int().min(0).max(20),
+    // Optional so older clients that don't send it leave it unchanged. [SEC-59]
+    autoCompleteHours: z.coerce.number().int().min(0).max(72).optional(),
     otpDailyCapNew: z.coerce.number().int().min(10).max(100000),
     otpDailyCapReturning: z.coerce.number().int().min(10).max(100000),
     otpSendPerIpHour: z.coerce.number().int().min(1).max(10000),
@@ -46,5 +49,6 @@ export const PUT = adminRoute("OWNER", async (req, { admin }) => {
     .values({ id: 1, ...b, updatedAt: new Date() })
     .onConflictDoUpdate({ target: schema.settings.id, set: { ...b, updatedAt: new Date() } });
   await audit(db, { actor: admin.email, action: "settings.update", entity: "Settings", entityId: "1", before, after: b });
+  await invalidateAllAvailability(); // e.g. max days ahead [SEC-60]
   return NextResponse.json({ ok: true });
 });

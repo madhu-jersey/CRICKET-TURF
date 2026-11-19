@@ -26,7 +26,7 @@ export function RetryButton({ id }: { id: string }) {
             setBusy(false);
           }
         }}
-        className="rounded-lg border border-zinc-300 px-3 py-1 text-xs font-bold hover:border-ink disabled:opacity-50"
+        className="inline-flex min-h-11 items-center rounded-lg border border-zinc-300 px-4 text-xs font-bold hover:border-ink disabled:opacity-50 md:min-h-0 md:py-1"
       >
         {busy ? "Retrying…" : "Retry"}
       </button>

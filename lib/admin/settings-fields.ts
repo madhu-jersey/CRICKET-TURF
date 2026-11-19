@@ -12,6 +12,7 @@ export const SETTINGS_FIELDS = [
   "maxActiveBookingsPerPhone",
   "maxBookingsPerPhonePerDay",
   "noShowBlockThreshold",
+  "autoCompleteHours",
   "otpDailyCapNew",
   "otpDailyCapReturning",
   "otpSendPerIpHour",

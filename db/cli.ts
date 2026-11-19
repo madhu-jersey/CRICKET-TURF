@@ -1,5 +1,5 @@
 /**
- * npm run db:migrate | db:seed | db:reset
+ * npm run db:migrate | db:seed | db:reset | deploy:migrate
  * Uses DATABASE_URL (Postgres) when set, otherwise the embedded PGlite database in PGLITE_DIR.
  * Stop the dev server before running these against PGlite (it allows a single process).
  */
@@ -35,9 +35,37 @@ async function open(): Promise<{ db: DB; close: () => Promise<void> }> {
   return createPgliteDb(process.env.PGLITE_DIR ?? DEFAULT_PGLITE_DIR);
 }
 
+/** Fixed key for the deploy-time migration lock (any constant bigint; same for every run). */
+export const MIGRATION_LOCK_KEY = 727_274_001;
+
+/**
+ * deploy:migrate — for real databases only. Takes a session-level advisory lock on one connection so
+ * two deploy runs (e.g. a retried CI job) can't apply migrations at the same time; the second waits,
+ * then finds nothing to do. Never seeds. [SEC-52]
+ */
+async function deployMigrate() {
+  const url = process.env.DATABASE_URL;
+  if (!url) {
+    console.error("deploy:migrate needs DATABASE_URL (the production or staging Postgres).");
+    process.exit(1);
+  }
+  const { default: postgres } = await import("postgres");
+  const client = postgres(url, { max: 1, prepare: false, onnotice: () => {} });
+  try {
+    console.log("Waiting for the migration lock…");
+    await client`select pg_advisory_lock(${MIGRATION_LOCK_KEY})`;
+    const ran = await runMigrations((q) => client.unsafe(q), async (q, p) => (await client.unsafe(q, p as never[])) as unknown as Record<string, unknown>[]);
+    console.log(ran.length ? `Applied migrations: ${ran.join(", ")}` : "Migrations already up to date.");
+    await client`select pg_advisory_unlock(${MIGRATION_LOCK_KEY})`;
+  } finally {
+    await client.end();
+  }
+}
+
 async function main() {
   await loadEnvFile();
   const cmd = process.argv[2];
+  if (cmd === "deploy") return deployMigrate();
   if (cmd === "reset") {
     if (process.env.DATABASE_URL) {
       const { default: postgres } = await import("postgres");

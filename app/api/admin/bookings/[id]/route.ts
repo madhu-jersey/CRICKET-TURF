@@ -4,7 +4,7 @@ import { desc, eq } from "drizzle-orm";
 import { AppError, readJson } from "@/lib/errors";
 import { adminRoute } from "@/lib/admin/route";
 import { getBookingById, netPaid } from "@/lib/booking/data";
-import { cancelBooking, markBalancePaid, notifyConfirmed, refundCancelledBooking, setBookingOutcome } from "@/lib/booking/service";
+import { cancelBooking, markBalancePaid, notifyConfirmed, markRefundedManually, refundCancelledBooking, setBookingOutcome } from "@/lib/booking/service";
 import { getDb, schema } from "@/db/client";
 import { enforceRateLimit } from "@/lib/ratelimit";
 
@@ -25,6 +25,7 @@ const action = z.discriminatedUnion("action", [
   z.object({ action: z.literal("resend") }),
   z.object({ action: z.literal("cancel"), refundMode: z.enum(["FULL", "PARTIAL", "NONE"]), amount: z.coerce.number().int().min(0).optional(), reason: z.string().max(300).optional() }),
   z.object({ action: z.literal("refund"), amount: z.coerce.number().int().min(1) }),
+  z.object({ action: z.literal("mark_refunded_manually") }),
 ]);
 
 export const POST = adminRoute<P>("STAFF", async (req, { admin }, { id }) => {
@@ -63,6 +64,10 @@ export const POST = adminRoute<P>("STAFF", async (req, { admin }, { id }) => {
     case "refund":
       if (admin.role !== "OWNER") throw new AppError("FORBIDDEN", "Only the owner can issue refunds.");
       return NextResponse.json({ refunded: await refundCancelledBooking(id, a.amount, actor) });
+    case "mark_refunded_manually":
+      // The owner refunded it outside the app (Razorpay dashboard) after automatic retries gave up. [SEC-49]
+      if (admin.role !== "OWNER") throw new AppError("FORBIDDEN", "Only the owner can record refunds.");
+      return NextResponse.json({ refunded: await markRefundedManually(id, actor) });
   }
   return NextResponse.json({ ok: true });
 });

@@ -31,7 +31,7 @@ export default async function MessagesPage({ searchParams }: { searchParams: Pro
       </p>
       <nav className="mb-4 flex flex-wrap gap-2 text-sm" aria-label="Filter by status">
         {["", "MOCKED", "SENT", "QUEUED", "FAILED"].map((s) => (
-          <Link key={s} href={s ? `?status=${s}` : "?"} aria-current={(status ?? "") === s ? "page" : undefined} className={`rounded-full border px-3 py-1 font-semibold ${(status ?? "") === s ? "border-ink bg-ink text-white" : "border-zinc-300 bg-white"}`}>
+          <Link key={s} href={s ? `?status=${s}` : "?"} aria-current={(status ?? "") === s ? "page" : undefined} className={`inline-flex min-h-11 items-center rounded-full border px-4 font-semibold md:min-h-0 md:py-1 ${(status ?? "") === s ? "border-ink bg-ink text-white" : "border-zinc-300 bg-white"}`}>
             {s || "All"}
           </Link>
         ))}
@@ -55,8 +55,8 @@ export default async function MessagesPage({ searchParams }: { searchParams: Pro
       <nav className="mt-4 flex justify-between text-sm" aria-label="Pagination">
         <span className="text-zinc-500">{n} message{n === 1 ? "" : "s"}</span>
         <span className="flex gap-2">
-          {page > 1 && <Link className="rounded-lg border border-zinc-300 bg-white px-3 py-1" href={`?${new URLSearchParams({ ...(status ? { status } : {}), page: String(page - 1) })}`}>← Newer</Link>}
-          {page * PAGE < n && <Link className="rounded-lg border border-zinc-300 bg-white px-3 py-1" href={`?${new URLSearchParams({ ...(status ? { status } : {}), page: String(page + 1) })}`}>Older →</Link>}
+          {page > 1 && <Link className="inline-flex min-h-11 items-center rounded-lg border border-zinc-300 bg-white px-4 md:min-h-0 md:py-1" href={`?${new URLSearchParams({ ...(status ? { status } : {}), page: String(page - 1) })}`}>← Newer</Link>}
+          {page * PAGE < n && <Link className="inline-flex min-h-11 items-center rounded-lg border border-zinc-300 bg-white px-4 md:min-h-0 md:py-1" href={`?${new URLSearchParams({ ...(status ? { status } : {}), page: String(page + 1) })}`}>Older →</Link>}
         </span>
       </nav>
     </>

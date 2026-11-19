@@ -41,7 +41,7 @@ export function CancelBooking({
       const r = await api<{ refunded: number; refundError?: string }>(`/api/bookings/${bookingCode}/cancel`, { method: "POST" });
       setResult(
         r.refundError
-          ? "Booking cancelled. The refund couldn't be started automatically — our team will process it manually."
+          ? "Booking cancelled. The refund didn't go through yet — we'll keep retrying automatically. You can check this page for the refund status."
           : r.refunded > 0
             ? `Booking cancelled. ${inr(r.refunded)} will be refunded to your original payment method in 5–7 working days.`
             : "Booking cancelled.",

@@ -58,7 +58,7 @@ export function BlockForm({ courts, initial, onDone, compact }: { courts: Court[
             <legend className="mb-1.5 text-sm font-semibold">Type</legend>
             <div className="flex h-10 items-center gap-3 text-sm">
               {(["single", "range", "weekly"] as const).map((k) => (
-                <label key={k} className="flex items-center gap-1"><input type="radio" name="bf-kind" checked={kind === k} onChange={() => setKind(k)} />{k === "single" ? "One day" : k === "range" ? "Date range" : "Every week"}</label>
+                <label key={k} className="flex min-h-11 items-center gap-2 md:min-h-0"><input type="radio" className="h-5 w-5" name="bf-kind" checked={kind === k} onChange={() => setKind(k)} />{k === "single" ? "One day" : k === "range" ? "Date range" : "Every week"}</label>
               ))}
             </div>
           </fieldset>

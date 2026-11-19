@@ -70,6 +70,8 @@ export const customers = pgTable("Customer", {
   blockedAt: ts("blockedAt"),
   blockedReason: text("blockedReason"),
   trustEpoch: integer("trustEpoch").notNull().default(0),
+  /** No-shows for slots before this don't count toward auto-blocking (set on unblock). [SEC-57] */
+  noShowResetAt: ts("noShowResetAt"),
   createdAt: ts("createdAt").notNull().defaultNow(),
 });
 
@@ -97,6 +99,12 @@ export const bookings = pgTable("Booking", {
   balanceAmount: integer("balanceAmount").notNull(),
   balancePaidAt: ts("balancePaidAt"),
   refundAmount: integer("refundAmount").notNull().default(0),
+  /** Refund still owed after a failed refund call; retried by the cron. [SEC-45] */
+  refundPendingAmount: integer("refundPendingAmount").notNull().default(0),
+  refundPendingSince: ts("refundPendingSince"),
+  refundAttempts: integer("refundAttempts").notNull().default(0),
+  /** Gave up retrying (24 h or 20 attempts): the owner must refund by hand. [SEC-49] */
+  refundNeedsManual: boolean("refundNeedsManual").notNull().default(false),
   discountAmount: integer("discountAmount").notNull().default(0),
   offerDeviceId: text("offerDeviceId"),
   source: text("source").$type<BookingSource>().notNull(),
@@ -121,6 +129,10 @@ export const payments = pgTable("Payment", {
   status: text("status").$type<PaymentStatus>().notNull(),
   refundAmount: integer("refundAmount").notNull().default(0),
   providerRefundId: text("providerRefundId"),
+  /** A refund call whose outcome is unknown: its key, reserved amount and start time. [SEC-49] */
+  refundInFlightKey: text("refundInFlightKey"),
+  refundInFlightAmount: integer("refundInFlightAmount").notNull().default(0),
+  refundInFlightAt: ts("refundInFlightAt"),
   paidAt: ts("paidAt"),
   refundedAt: ts("refundedAt"),
   rawWebhookPayload: jsonb("rawWebhookPayload"),
@@ -207,6 +219,7 @@ export const settings = pgTable("Settings", {
   address: text("address").notNull(),
   mapLink: text("mapLink").notNull(),
   phone: text("phone").notNull(),
+  autoCompleteHours: integer("autoCompleteHours").notNull().default(6),
   updatedAt: ts("updatedAt").notNull().defaultNow(),
 });
 

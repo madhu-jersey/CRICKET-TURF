@@ -5,6 +5,8 @@ import { otpCapUsage } from "@/lib/otp-service";
 import { Card, PageHeader } from "@/components/admin/shell";
 import { formatTimeRange, formatDateShort, istToUtc, formatWeekday } from "@/lib/time";
 import { inr } from "@/lib/utils";
+import { refundsNeedingAttention } from "@/lib/booking/service";
+import { RefundAttention } from "@/components/admin/refund-attention";
 
 export const metadata = { title: "Overview" };
 
@@ -12,7 +14,7 @@ const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
 export default async function OverviewPage() {
   await requireAdminPage("OWNER");
-  const [o, otp] = await Promise.all([overview(), otpCapUsage()]);
+  const [o, otp, refunds] = await Promise.all([overview(), otpCapUsage(), refundsNeedingAttention()]);
   const maxRev = Math.max(1, ...o.revenueByDay.map((d) => d.advance + d.balance));
   const maxHeat = Math.max(1, ...o.heat.flat());
   const weekTotal = o.revenueByDay.reduce((s, d) => s + d.advance + d.balance, 0);
@@ -22,6 +24,8 @@ export default async function OverviewPage() {
       <PageHeader title="Overview">
         <Link href="/admin/walk-in" className="inline-flex min-h-11 items-center rounded-full bg-ink px-4 text-sm font-bold text-flood md:min-h-0 md:py-2">+ Walk-in booking</Link>
       </PageHeader>
+
+      <RefundAttention rows={refunds.map((r) => ({ ...r, since: r.since ? r.since.toISOString() : null }))} />
 
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <Card><p className="text-sm text-zinc-500">Bookings today</p><p className="mt-1 font-display text-4xl font-bold" data-testid="kpi-today">{o.todayCount}</p></Card>
@@ -80,7 +84,7 @@ export default async function OverviewPage() {
               </li>
             ))}
           </ul>
-          <Link href="/admin/schedule" className="mt-2 inline-block text-sm font-semibold underline">Open schedule →</Link>
+          <Link href="/admin/schedule" className="mt-2 inline-flex min-h-11 items-center text-sm font-semibold underline md:min-h-0">Open schedule →</Link>
         </Card>
       </div>
 

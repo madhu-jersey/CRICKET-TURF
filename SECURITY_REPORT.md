@@ -2,7 +2,7 @@
 
 **Scope:** full codebase review + testing of the Next.js turf booking site (box cricket + pickleball): public booking with phone OTP, ₹ advance payment (Razorpay / mock), WhatsApp messaging, owner/staff dashboard.
 **Environment:** local only — embedded Postgres (PGlite, real Postgres 17 with the real migrations), mock OTP / WhatsApp / payment providers, isolated production build on `localhost:3100`. No production systems, real payment accounts or real phone numbers were used.
-**Date:** 18 Nov 2026 · **Version tested:** `main` + the fixes in this report. **Follow-up round (SEC-33 → SEC-40):** same day, branch `security-review`; real Postgres 17 (embedded, 25 connections) added for race testing. **Third round (SEC-41 → SEC-43):** 19 Nov 2026 — admin recovery codes, admin pages tested on a phone screen, fresh code for refund cancels.
+**Date:** 18 Nov 2026 · **Version tested:** `main` + the fixes in this report. **Follow-up round (SEC-33 → SEC-40):** same day, branch `security-review`; real Postgres 17 (embedded, 25 connections) added for race testing. **Third round (SEC-41 → SEC-43):** 19 Nov 2026 — admin recovery codes, admin pages tested on a phone screen, fresh code for refund cancels. **Fourth round (SEC-44 → SEC-48):** same day — defects found while writing `docs/ARCHITECTURE.md`. **Hardening round (SEC-49 onward):** branch `security-hardening`, the remaining risks from `docs/ARCHITECTURE.md` §15.
 
 > Note: this site **keeps online advance payment** (owner decision), so the review covers both the "no payment" checklist (booking abuse, OTP flooding, access control) and the payment checks (fake/forged/replayed payments, refunds).
 
@@ -13,16 +13,16 @@
 | Severity | Found | Fixed | Accepted risk | Needs owner action |
 |---|---|---|---|---|
 | Critical | 1 | 1 | – | – |
-| High | 7 | 7 | – | – |
-| Medium | 15 | 15 | – | – |
-| Low | 11 | 10 | 1 | – |
+| High | 9 | 9 | – | – |
+| Medium | 24 | 24 | – | – |
+| Low | 21 | 20 | 1 | – |
 | Info | – | – | 3 | 1 (Supabase RLS, if used) |
 
-Counts include the follow-up rounds (SEC-33 → SEC-43). Turnstile is no longer "needs owner action": a live server now refuses to start without it.
+Counts include the follow-up rounds (SEC-33 → SEC-64). Turnstile is no longer "needs owner action": a live server now refuses to start without it.
 
 **Overall risk after fixes: Low.** Every Critical, High and Medium issue is fixed and covered by an automated test. The code is **safe to go live once the go-live checklist (§5) is done**. The new startup check refuses to run a live (`DEMO_MODE=false`) server until the critical items are set.
 
-**Tests (after the third round, 19 Nov 2026):** 121 Vitest tests on PGlite (+8 race tests skipped there), **129/129 on real Postgres 17** (`npm run test:realdb`), **8/8 race tests** with 25 truly parallel connections (`npm run test:concurrency`), **32 Playwright tests** (desktop + mobile; the admin schedule, walk-in, bookings list and settings tests now run on both; 14 desktop-only tests skipped on mobile). All pass. `npm audit --omit=dev`: 0 vulnerabilities.
+**Tests (after the fourth round, 19 Nov 2026; superseded below):** 127 Vitest tests on PGlite (+10 race tests skipped there), **137/137 on real Postgres 17** (`npm run test:realdb`), **10/10 race tests** with 25 truly parallel connections (`npm run test:concurrency`), **33 Playwright tests** pass (desktop + mobile; 15 desktop-only tests skipped on mobile). All pass. `npm audit --omit=dev`: 0 vulnerabilities.
 
 The most important findings were:
 - **SEC-01 (Critical):** on a live site where `PAYMENT_PROVIDER` wasn't set, the demo "Simulate success" checkout still worked, so **anyone could book for free**.
@@ -247,6 +247,121 @@ Razorpay Orders/Refunds API · WhatsApp Cloud API or BSP · MSG91 SMS · Cloudfl
 - **Fix:** the verified-phone cookie now records how the phone was verified (`otp` or `trusted`) and when. A customer cancel that would refund money needs a code typed in the last **10 minutes**; otherwise the server answers `FRESH_OTP_REQUIRED` and nothing changes. "Send code" with `fresh: true` skips the remembered-device shortcut. The check runs in the route (before the 3-cancels-a-day counter, so a refused try doesn't use one up) and again inside the locked cancel transaction, using the exact refund that would be paid. Cancels with nothing to refund (inside the cutoff, or nothing paid online) behave as before. Old cookies without the new fields count as "not fresh". The cancel screen asks for a new code whenever a refund is due. Staff/owner cancels are unchanged.
 - **Tests:** `recovery-refund.test.ts › SEC-43` (refused without a fresh code with no change to booking or payment; works with one; no-refund cancels unaffected; admin cancels unaffected; 10-minute window; legacy tokens); `http.spec.ts › SEC-43` (remembered device → 401 `FRESH_OTP_REQUIRED`, booking still confirmed; fresh code → refund; walk-in with no online payment → cancel works on the remembered device); `booking.spec.ts › cancel with refund` (the browser flow now asks for a new code).
 
+### Fourth round (SEC-44 → SEC-48)
+
+Found while writing `docs/ARCHITECTURE.md` from the code (SEC-44 → SEC-47); SEC-48 was exposed by the new SEC-47 test on real Postgres.
+
+### SEC-44 — Gallery images stored in the database never loaded · **Medium** · Fixed
+- **Proof:** with the default `STORAGE_PROVIDER=db`, `lib/storage.ts` saves uploads with the URL `/api/files/<id>`, but no such route existed (git history shows it never did). Every uploaded photo was a broken image. Supabase-hosted photos would also have been rejected by `next/image` (host not in `remotePatterns`).
+- **Fix:** `app/api/files/[id]/route.ts` serves stored files: UUID ids only, only `image/*` rows (all are WebP re-encoded by `sanitizeImage()`), `Cache-Control: public, max-age=31536000, immutable`, `nosniff`, `default-src 'none'` CSP, `Cross-Origin-Resource-Policy: same-origin`. `next.config.ts` allows `*.supabase.co/storage/v1/object/public/**`.
+- **Tests:** `tests/security/review-fixes.test.ts › SEC-44` (stored → served as WebP; unknown and path-like ids 404); `http.spec.ts › SEC-44` (owner uploads a JPEG with EXIF → served as WebP without the metadata → the Next.js image optimiser loads it → after delete it 404s).
+
+### SEC-45 — A failed automatic refund after a late payment was lost · **High** · Fixed
+- **Proof:** in `confirmPayment()`, the refund for a late payment whose slot was taken ran after the transaction committed. If the Razorpay refund call failed, the webhook returned 500; Razorpay's retry then found the payment `PAID` and returned `ALREADY_PROCESSED`, so the refund was never retried, nothing was audit-logged and nobody was told. The customer's money stayed with the venue. Separately, two refunds of one payment running at once (e.g. a retry and an owner's manual refund) could both call the provider.
+- **Fix:** a failed refund (late payment, customer cancel, admin cancel) records the amount still owed in the new `Booking.refundPendingAmount` (migration 0008), writes `booking.refund_failed`, and alerts the owner (once per booking per day). The webhook returns 200. The 15-minute cron's `retryPendingRefunds()` claims each pending amount with a compare-and-set, refunds, and puts back whatever still fails. Each refund now reserves its amount on the Payment row (`refundAmount + x ≤ amount`) before calling the provider and releases it on failure, so no combination of retries and manual refunds can pay back more than was paid. An owner's manual refund also settles the pending amount. The admin drawer shows "Refund pending", and the customer is told the refund will be retried.
+- **Tests:** `review-fixes.test.ts › SEC-45` (late payment with a failing provider → webhook succeeds, pending 300, audit + alert; retry while still failing keeps it; retry after recovery refunds and notifies once; manual refund settles the pending amount so the cron doesn't pay again); `races.test.ts` (3 cron retries + 3 owner refunds in parallel → the provider is called once, ₹300 refunded in total).
+
+### SEC-46 — WhatsApp OTP failures were reported as "code sent" · **Medium** · Fixed
+- **Proof:** `WhatsAppOtp.send()` queued the message and returned success even when all three delivery attempts failed (the outbox swallows errors). Customers saw "code sent" and waited for a code that never came, and the admin login's SMS fallback (which only ran when sending threw) could never run — with WhatsApp down, admins with 2FA were locked out.
+- **Fix:** `dispatchMessage()` returns the final status; `WhatsAppOtp` throws `PROVIDER_ERROR` when delivery failed. `lib/providers/otp.ts › deliverOtpCode()` is shared by customer OTPs and admin codes: the configured channel first, MSG91 SMS if that fails and its keys are set. If every channel fails, the customer's new code is withdrawn and they see an error.
+- **Tests:** `review-fixes.test.ts › SEC-46` (WhatsApp down, no SMS → `PROVIDER_ERROR`, code withdrawn, outbox row FAILED after 3 attempts; WhatsApp down with MSG91 → code sent by SMS; admin login code: error without SMS, SMS with it).
+
+### SEC-47 — A blocked slot and a booking could be created for the same time · **Medium** · Fixed
+- **Proof:** blocks are not part of the `no_overlap` exclusion constraint. `createBlocks()` checked for overlapping bookings without any lock, and holds read the slot grid before their transaction, so a block and a hold created at the same moment could both succeed. With the fix removed, the new race test failed 3 runs out of 3 (e.g. "19:00: block OK and 1 of 6 holds OK").
+- **Fix:** `createBlocks()` takes the same court-day advisory locks as holds and walk-ins (every IST day a block touches, in sorted order), and holds and walk-ins re-check blocks inside their transaction after the lock (`assertNotBlocked()`).
+- **Tests:** `races.test.ts` — 5 rounds of 6 holds + 1 block in parallel on real Postgres: either the block wins and no hold does, or exactly one hold wins and the block is refused.
+
+### SEC-48 — Creating a blocked slot crashed on real Postgres · **Medium** · Fixed
+- **Proof:** the SEC-47 test on Postgres 17 failed with `ERR_INVALID_ARG_TYPE` from `createBlocks()`: a JavaScript `Date` was embedded in a raw `sql` fragment. PGlite (used by `npm test` and the e2e server) accepts it; postgres-js (production) does not. On a live site the owner could not block any slot.
+- **Fix:** the overlap check uses typed Drizzle operators (`or` / `and` / `gt`). No other raw `sql` fragment embeds a date.
+- **Tests:** `races.test.ts` exercises `createBlocks()` on Postgres 17 (CI `concurrency` job). Lesson recorded in `docs/ARCHITECTURE.md` §15: run `npm run test:realdb` before every release, not only `npm test`.
+
+### Hardening round — P1: money and OTP (SEC-49 → SEC-51)
+
+### SEC-49 — A refund retry after a timeout could refund twice · **High** · Fixed
+- **Proof:** `refundSinglePayment()` released its reservation whenever the provider call threw. A timeout (or network error, or Razorpay 5xx) can mean Razorpay already made the refund, so the cron's retry would refund again — for a full refund the reservation guard stopped the second one only because nothing was left, but for partial refunds (e.g. a 50 % policy) a second refund fitted within the captured amount. Pending refunds were also retried forever.
+- **Fix:** every gateway refund gets a fresh key (`rf_…`), stored on the Payment with the amount and time **before** the call (the same atomic update that reserves the amount, and only if no other refund of that payment is in flight). The key goes to Razorpay as `receipt` and `notes.refund_key`. Timeouts, network errors and 5xx raise `ProviderOutcomeUnknown`: the reservation and key are **kept**. The cron's new `reconcileInFlightRefunds()` (in-flight refunds older than 1 minute) calls `GET /v1/payments/{id}/refunds` and matches the key: found → recorded as done; not found → reservation released, then retried normally. 4xx answers are definite failures and release at once. Pending refunds give up after 20 failed attempts or 24 hours: the booking is marked `refundNeedsManual` (migration 0009), retries stop, the owner gets one alert, and the Overview shows "Refunds needing attention" with a "Mark refunded" action (owner, audit-logged `booking.refund_marked_manual`).
+- **Tests:** `tests/security/hardening-p1.test.ts › SEC-49` — timeout but the refund exists → found by key, provider called once (also when the retry runs before the reconcile); timeout and no refund → released and retried exactly once; in-flight refunds younger than a minute untouched; 20 failures → needs manual, exactly 20 provider calls, one alert, owner records it; 24 h → needs manual.
+
+### SEC-50 — OTP fallback to SMS took up to ~48 s when WhatsApp was failing · **Medium** · Fixed
+- **Proof:** WhatsApp OTPs went through the outbox's three attempts with 15 s timeouts and 1 s + 2 s backoff sleeps before `deliverOtpCode()` could fall back to SMS.
+- **Fix:** OTPs use `dispatchOnce()`: one attempt with a 5 s deadline (`OTP_WHATSAPP_TIMEOUT_MS`), no sleeps; then SMS straight away. Other messages keep the background retries.
+- **Tests:** `hardening-p1.test.ts › SEC-50` — a WhatsApp provider that hangs for 10 s: SMS is called between 4.5 s and 6.5 s, the whole request finishes in under 8 s, the outbox row is `FAILED` after 1 attempt.
+
+### SEC-51 — `/api/files/[id]` served any stored image and had no rate limit · **Low** · Fixed
+- **Fix:** files are served only if a `GalleryImage` row points at them (`storageKey = 'db:<id>'`); 300 requests per minute per network (shared fixed window) → 429 with `Retry-After`.
+- **Tests:** `hardening-p1.test.ts › SEC-51` — a StoredFile with no gallery entry is 404 and is served once it belongs to the gallery; 300 requests pass, the 301st is 429, another network is unaffected.
+
+### Hardening round — P2: go-live blockers (SEC-52 → SEC-56)
+
+### SEC-52 — A deploy could run against a database missing migrations · **Medium** · Fixed
+- **Proof:** migrations were a manual step; the dev server failed with "column does not exist" after 0006, 0007 and 0008 until restarted with the new schema. Nothing stopped two migration runs overlapping.
+- **Fix:** `db/migration-list.ts` lists every expected migration (a test keeps it equal to `db/migrations/`; the .sql files may not be bundled on Vercel). A live server checks `_migrations` at startup and refuses to start, naming each missing file. `npm run deploy:migrate` applies migrations on one connection under `pg_advisory_lock` (fixed key), never seeds. New manual-only workflow `migrate-production` (typed confirmation, `production` environment, `PRODUCTION_DATABASE_URL` secret). README order: migrate → deploy.
+- **Tests:** `tests/security/hardening-p2.test.ts › SEC-52` (list equals the folder; a deleted `_migrations` row → the startup check names it and exits 1); `tests/concurrency/deploy-migrate.test.ts` (two parallel `deploy:migrate` processes on a fresh Postgres database: both exit 0, one applies, one finds nothing to do, every migration recorded once).
+
+### SEC-53 — No safe way to create or recover owner accounts on a live database · **Medium** · Fixed
+- **Proof:** the only built-in way to get an owner was `db:seed` (demo admins + demo bookings) or hand-written SQL; if the owner lost both phone and recovery codes, recovery needed direct database edits.
+- **Fix:** `npm run admin:create` (hidden password prompt, password rules, Indian mobile required, refuses if an active OWNER exists unless `--force`), `npm run admin:remove-demo` (deactivates and signs out the demo accounts), `npm run admin:recover` (temporary password + forced change, bumps `trustEpoch`, deletes sessions and recovery codes, optional new phone, audited). Logic in `lib/admin/tools.ts`, CLI in `scripts/admin.ts`.
+- **Tests:** `hardening-p2.test.ts › SEC-53`; also run by hand against a throwaway database (create, weak password refused, remove-demo, recover).
+
+### SEC-54 — Money problems weren't alerted · **Medium** · Fixed
+- **Fix:** every `payment.amount_mismatch` sends the owner a WhatsApp alert (the booking stays unconfirmed). Webhooks with a bad signature are counted per clock hour (shared counter); above 5 in an hour the owner gets one alert for that hour (e.g. a wrong `RAZORPAY_WEBHOOK_SECRET` after rotating keys).
+- **Tests:** `hardening-p2.test.ts › SEC-54` (mismatch → one alert, booking still pending, a duplicate event doesn't alert again; 9 bad signatures → exactly one alert; 5 → none).
+
+### SEC-55 — No error tracking or health check · **Low** · Fixed
+- **Fix:** optional `SENTRY_DSN`: unexpected route-handler errors and page errors (`instrumentation.ts › onRequestError`) are sent via Sentry's envelope API (no SDK) with phone numbers and e-mails masked, path without query string, and no bodies, headers or cookies; a live server warns at startup if it's unset. `GET /api/health` → `ok` 200 when `select 1` answers within 2 s, else `unavailable` 503; no auth, no data. README: UptimeRobot setup.
+- **Tests:** `hardening-p2.test.ts › SEC-55` (scrubbing; nothing sent without a DSN; envelope endpoint, auth header and scrubbed body with one; startup warning; health 200 / 503 when the DB hangs (answers in under 3 s) / 503 when it errors).
+
+### SEC-56 — Scheduled jobs assumed Vercel Pro · **Low** · Fixed (documented)
+- **Finding:** Vercel Hobby is for non-commercial use and rejects per-minute schedules. Checked: hold expiry is lazy (crons only tidy up), reminders go to any confirmed booking starting within 2 h without one (so an hourly or late run still sends them, once), refund reconcile/retry and stuck-message retry are idempotent.
+- **Fix:** README documents Vercel Pro, Supabase `pg_cron` + `pg_net` (SQL included) and cron-job.org (bearer header), and that hourly is enough.
+- **Tests:** `hardening-p2.test.ts › SEC-56` (a run 90 minutes before start sends the reminder; the next hourly run doesn't resend).
+
+### Hardening round — P3: smaller fixes (SEC-57 → SEC-63)
+
+### SEC-57 — Unblocking a customer didn't reset their no-show count · **Low** · Fixed
+- **Fix:** `Customer.noShowResetAt` (migration 0010) is set when the owner unblocks; auto-block counts only no-shows for slots after it.
+- **Tests:** `hardening-p3.test.ts › SEC-57` (3 no-shows block; after unblock the next no-show doesn't re-block — before the fix the count would have been 4).
+
+### SEC-58 — Limiter cleanup ran randomly inside user requests · **Low** · Fixed
+- **Proof:** `hitRateLimit()` deleted old rows on ~2 % of requests and the counter store on ~1 %; the counter cleanup used the real clock, which also made a test flaky.
+- **Fix:** the 15-minute cron's `cleanupLimiterTables()` deletes `RateLimitHit` rows older than 48 h and expired `Counter` rows, at most 10 000 of each per run; the random cleanups are gone.
+- **Tests:** `hardening-p3.test.ts › SEC-58` (old removed, recent kept, batch size respected).
+
+### SEC-59 — Bookings were never marked completed automatically · **Low** · Fixed
+- **Fix:** Settings `autoCompleteHours` (default 6, 0 = off; editable in Settings). The cron marks `CONFIRMED` bookings `COMPLETED` that long after they end; it never sets `NO_SHOW`, so auto-blocking counts only staff-marked no-shows. Staff can still switch COMPLETED ↔ NO_SHOW.
+- **Tests:** `hardening-p3.test.ts › SEC-59`.
+
+### SEC-60 — Price, hours and holiday edits could show stale prices for up to 12 s · **Low** · Fixed
+- **Fix:** cache entries also carry `availcfg:<court>` and `availcfg:all` versions; pricing and courts edits bump the court's version, holiday and Settings edits bump the global one.
+- **Tests:** `hardening-p3.test.ts › SEC-60` (cached value served, then the new price/holiday immediately after invalidation); `http.spec.ts › SEC-60` (owner edits prices → the very next `/api/availability` shows them).
+
+### SEC-61 — The booking form could open payment for a price the customer hadn't seen · **Medium** · Fixed
+- **Proof:** the server always charges its own price, and the form showed the server's amounts after the hold — but the payment window opened automatically, so a price changed between grid load and "Pay" (or an offer no longer applying) went unnoticed.
+- **Fix:** if the hold's total or advance differs from what the form showed, a "Price updated" notice shows both amounts and payment waits for the customer.
+- **Tests:** `http.spec.ts › SEC-61` (browser: the owner changes every cricket price after the grid loaded → notice with the old and new totals, booking held at the server's price, payment not opened).
+
+### SEC-62 — Raw SQL audit (the SEC-48 bug class) · **Low** · Fixed (guarded)
+- **Audit:** all 32 raw `sql` fragments in app code checked. None embeds a JS `Date`; the one date value (`refundPendingSince`) is passed as `now.toISOString()::timestamptz`. Every other interpolation is a column, a number or a string.
+- **Guard:** `tests/unit/raw-sql.test.ts` scans every raw fragment and fails on date-like values that aren't converted, so the bug can't come back unnoticed; the realdb suite (in `release:check` and CI) runs every fragment on Postgres 17.
+
+### SEC-63 — Remaining admin pages had small tap targets · **Low** · Fixed
+- **Proof:** the mobile check, extended to overview, pricing, courts, gallery, team, audit, message outbox, customers and blocked slots, found: "Open schedule" link 20 px; pricing band remove ✕ 11 × 20 px, "+ Add time band" 20 px, checkboxes/radios 13 × 13 px; small `size="sm"` buttons 36–40 px; gallery move/delete buttons 22 px, file input 36 px; holiday/blocked "Remove" 26 px; pagination and outbox filter links 30 px; outbox Retry 26 px; customer search 40 px.
+- **Fix:** all at least 44 px on phones (the `sm` button size gets `min-h-11` below `md`); desktop unchanged. CI (Linux fonts) then caught the pricing editor's price boxes at 34 px wide on a phone — Windows fonts had made them just wide enough locally; the bands are now a grid that wraps on phones (From/To, then price + remove) with a 5rem minimum price box.
+- **Tests:** `tests/e2e/admin-panels.spec.ts` (one test visits all nine pages on mobile with soft assertions).
+
+### SEC-64 — gitleaks CI job failed on test fixtures · **Low** · Fixed (reviewed allowlist)
+- **Finding:** gitleaks 8.24.3 (the CI version, downloaded locally from the official release and checked against its published SHA-256) scanned all 8 commits and reported 9 `generic-api-key` findings, all test values:
+  - `Temp-Pass-12345` × 7 (`tests/security/http.spec.ts`, `tests/security/followup.test.ts`) and `Floodlit-Turf-2026` × 1 (`tests/security/hardening-p2.test.ts`): passwords of throwaway admin accounts that tests create on the isolated e2e server or in-memory test databases;
+  - `e2e-cron-secret-0123456789` × 1 (`scripts/e2e-server.mjs`): the cron secret of the local Playwright server on port 3100.
+  None is used by any real deployment, so nothing needs rotating.
+- **Fix:** `.gitleaks.toml` keeps the default rules and adds two allowlists on the `generic-api-key` rule, each requiring the exact value **and** the exact file (`condition = "AND"`), with a reason per entry.
+- **Verified:** full-history scan → "no leaks found" (exit 0). Negative control: a fake API key placed in `tests/security/http.spec.ts` is still reported, and the allowlisted test password is still reported when it appears in any other file.
+
+**Also:** `memoryRateLimit()` (dead code) removed; `npm run release:check` added and documented as required before every deploy.
+
+**Tests (after the hardening round, 19 Nov 2026):** Vitest 165 tests — 154 pass + 11 real-Postgres-only skipped on PGlite, **165/165 on real Postgres 17**; race + deploy-migrate suite 11/11; Playwright **37 pass**, 17 skipped (desktop-only tests on the mobile project). Typecheck clean.
+
 ### SEC-28 — Dev dependency advisory (picomatch ReDoS via vitest) · **Low** · Fixed (resolved upstream)
 - Earlier: 5 high advisories in `picomatch` inside the test runner. Re-checked 18 Nov 2026: `npm audit` and `npm audit --omit=dev` both report **0 vulnerabilities**. CI now fails on any high advisory in production dependencies.
 
@@ -336,14 +451,24 @@ Razorpay Orders/Refunds API · WhatsApp Cloud API or BSP · MSG91 SMS · Cloudfl
 
 | Job | What it does | Fails the build when | Local result |
 |---|---|---|---|
-| unit | `npm ci`, typecheck, `npm test` (PGlite) | any test fails | 121 passed, 8 skipped |
-| concurrency | `postgres:17` service; `npm run test:concurrency` and `npm run test:realdb` | any test fails | 8/8 and 129/129 (embedded Postgres 17) |
-| e2e | Playwright desktop + mobile, incl. HTTP security specs | any test fails | 32 passed, 14 skipped (desktop-only) |
-| secrets | gitleaks over the full history (`fetch-depth: 0`) | any leak found | not run locally; regex scan: 0 hits |
+| unit | `npm ci`, typecheck, `npm test` (PGlite) | any test fails | 154 passed, 11 skipped |
+| concurrency | `postgres:17` service; `npm run test:concurrency` and `npm run test:realdb` | any test fails | 11/11 and 165/165 (embedded Postgres 17) |
+| e2e | Playwright desktop + mobile, incl. HTTP security specs | any test fails | 37 passed, 17 skipped (desktop-only) |
+| secrets | gitleaks over the full history (`fetch-depth: 0`), config `.gitleaks.toml` | any leak found | not run locally; regex scan: 0 hits |
 | sast | semgrep `p/nextjs p/typescript p/secrets p/owasp-top-ten` | any ERROR finding | not run locally |
 | audit | `npm audit --omit=dev --audit-level=high` | high/critical advisory | 0 vulnerabilities |
 | zap | ZAP baseline against a local build, rules in `.zap/rules.tsv` | a FAIL-level rule fires | not run locally |
 
 All jobs use mock providers and throwaway databases; no secrets are needed. Reports are uploaded as build artifacts. `.zap/rules.tsv` ignores only informational rules (timestamps, comments in minified bundles) and keeps the `style-src 'unsafe-inline'` finding as a warning (accepted, SEC-30).
 
-**Status: the workflow has not run yet** (branch not pushed). After the first run, record any semgrep/ZAP/gitleaks findings here as new SEC entries — fix them or mark them accepted with a reason.
+**Latest: all 7 jobs pass on `security-hardening` @ 36679c8** (unit, real Postgres, Playwright desktop + mobile, gitleaks, semgrep, npm audit, ZAP).
+
+**CI results (GitHub Actions, 19 Nov 2026)** — runs on `main` @ 28f1efd and `security-hardening` @ 769a45a (P1) and 4647baa (P2):
+
+| Job | Result | Notes |
+|---|---|---|
+| unit, concurrency, e2e | ✅ pass on all three | |
+| semgrep (`p/nextjs p/typescript p/secrets p/owasp-top-ten`, fail on ERROR) | ✅ pass | No ERROR-level findings. WARNING/INFO findings, if any, are only in the `semgrep` artifact (needs a GitHub login to download) — not reviewed. |
+| npm audit (production, high+) | ✅ pass | 0 vulnerabilities |
+| ZAP baseline | ✅ pass | No FAIL-level rule fired. WARN-level alerts are only in the `zap-report` artifact — not reviewed. |
+| **gitleaks (full history)** | ❌ failed on those three runs → ✅ fixed | 9 findings, all test fixtures (SEC-64). Reviewed and allowlisted by exact value + file in `.gitleaks.toml`; a local full-history scan with the CI version is clean. |

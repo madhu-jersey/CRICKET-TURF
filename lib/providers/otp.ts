@@ -7,7 +7,10 @@
 import "server-only";
 import { env, mockOtpAllowed } from "@/lib/env";
 import { getDb } from "@/db/client";
-import { enqueueMessage, dispatchMessage } from "@/lib/messaging";
+import { enqueueMessage, dispatchMessage, dispatchOnce } from "@/lib/messaging";
+
+/** One WhatsApp try for codes, then SMS: a customer shouldn't wait more than ~5 s for the fallback. [SEC-50] */
+export const OTP_WHATSAPP_TIMEOUT_MS = 5_000;
 import { AppError } from "@/lib/errors";
 import { maskForLog } from "@/lib/security";
 
@@ -38,7 +41,10 @@ export class WhatsAppOtp implements OtpProvider {
     // OTP is a user-initiated authentication message, so it is sent regardless of marketing opt-in.
     // The code itself is masked in the outbox log.
     const id = await enqueueMessage(db, { phone, template: "otp_code", params: { code }, logParams: { code: "••••••" }, optedIn: true });
-    if (id) await dispatchMessage(id, { code });
+    // One attempt with a 5 s deadline, no backoff sleeps. If it fails, the caller must know (and falls
+    // back to SMS) instead of telling the user "code sent". [SEC-46][SEC-50]
+    const status = id ? await dispatchOnce(id, { code }, OTP_WHATSAPP_TIMEOUT_MS) : "MISSING";
+    if (status !== "SENT" && status !== "MOCKED") throw new AppError("PROVIDER_ERROR", "We couldn't send the code on WhatsApp. Please try again in a minute.");
     return {};
   }
 }
@@ -74,5 +80,29 @@ export function getOtpProvider(): OtpProvider {
       return new SmsOtp(env.str("MSG91_AUTH_KEY"), env.str("MSG91_OTP_TEMPLATE_ID"));
     default:
       return new MockOtp();
+  }
+}
+
+/** MSG91 SMS as a backup channel, if its keys are configured. */
+export function smsFallback(): SmsOtp | null {
+  const key = env.str("MSG91_AUTH_KEY");
+  const tpl = env.str("MSG91_OTP_TEMPLATE_ID");
+  return key && tpl ? new SmsOtp(key, tpl) : null;
+}
+
+/**
+ * Sends a code over the configured OTP channel. If that channel fails (e.g. WhatsApp is down or the
+ * template is rejected) and MSG91 is configured, the code goes by SMS instead. Used for customer
+ * OTPs and admin login/reset codes. Throws PROVIDER_ERROR only when every channel failed. [SEC-46]
+ */
+export async function deliverOtpCode(phone: string, code: string): Promise<{ devCode?: string; channel: OtpProvider["name"] }> {
+  const primary = getOtpProvider();
+  try {
+    return { ...(await primary.send(phone, code)), channel: primary.name };
+  } catch (e) {
+    const sms = primary.name === "sms" ? null : smsFallback();
+    if (!sms) throw e;
+    console.warn(`[otp] ${primary.name} delivery failed, falling back to SMS: ${e instanceof Error ? e.message : e}`);
+    return { ...(await sms.send(phone, code)), channel: "sms" };
   }
 }

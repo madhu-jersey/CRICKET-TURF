@@ -6,7 +6,7 @@ import { env } from "@/lib/env";
 import { AppError } from "@/lib/errors";
 import { hitRateLimit } from "@/lib/ratelimit";
 import { checkOtp, generateOtpCode, hashOtp, OTP_TTL_MS } from "@/lib/otp";
-import { getOtpProvider } from "@/lib/providers/otp";
+import { deliverOtpCode } from "@/lib/providers/otp";
 import { getSettings } from "@/lib/booking/data";
 import { alertOwner } from "@/lib/alerts";
 import { getCounterStore } from "@/lib/counter";
@@ -85,8 +85,18 @@ export async function sendOtp(phone: string, ip: string, now = new Date()): Prom
     .set({ consumedAt: now })
     .where(and(eq(schema.otpRequests.phone, phone), isNull(schema.otpRequests.consumedAt)));
   await db.insert(schema.otpRequests).values({ phone, codeHash: hashOtp(phone, code, env.appSecret), expiresAt, ip, createdAt: now });
-  const { devCode } = await getOtpProvider().send(phone, code);
-  return { devCode, expiresAt };
+  // WhatsApp first, SMS if WhatsApp fails and MSG91 is configured. If every channel fails, the code
+  // is withdrawn and the customer sees an error instead of "code sent". [SEC-46]
+  try {
+    const { devCode } = await deliverOtpCode(phone, code);
+    return { devCode, expiresAt };
+  } catch (e) {
+    await db
+      .update(schema.otpRequests)
+      .set({ consumedAt: now })
+      .where(and(eq(schema.otpRequests.phone, phone), isNull(schema.otpRequests.consumedAt)));
+    throw e instanceof AppError ? e : new AppError("PROVIDER_ERROR", "We couldn't send the code. Please try again in a minute.");
+  }
 }
 
 export async function verifyOtp(phone: string, code: string, now = new Date()): Promise<void> {

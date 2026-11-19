@@ -68,7 +68,9 @@ test("admin: login → walk-in → block slot → edit price → public grid sho
   // Public slot grid reflects the new price.
   const { key } = weekdayDate();
   await page.goto(`/book?sport=cricket&date=${key}`);
-  await expect(page.locator('button[data-time="10:00"]')).toContainText("₹777");
+  // Any free daytime slot (06:00–17:00 uses the edited day rate); demo data may have booked some.
+  const dayFree = page.locator('button[data-state="AVAILABLE"]').filter({ has: page.locator("xpath=self::*[number(substring(@data-time,1,2)) < 18]") }).first();
+  await expect(dayFree).toContainText("₹777");
 
   // And the pickleball block shows as closed for customers.
   await page.goto(`/book?sport=pickleball&date=${istDate(2)}`);

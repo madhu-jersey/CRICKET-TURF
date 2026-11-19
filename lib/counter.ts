@@ -4,7 +4,7 @@
  * Both increment atomically, so every server instance shares the same count. [SEC-37]
  */
 import "server-only";
-import { eq, lt, sql } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { getDb, schema } from "@/db/client";
 import { env } from "@/lib/env";
 
@@ -22,7 +22,6 @@ export class PgCounterStore implements CounterStore {
       .values({ key, count: by, expiresAt })
       .onConflictDoUpdate({ target: schema.counters.key, set: { count: sql`${schema.counters.count} + ${by}` } })
       .returning({ count: schema.counters.count });
-    if (Math.random() < 0.01) await db.delete(schema.counters).where(lt(schema.counters.expiresAt, new Date()));
     return row.count;
   }
   async get(key: string) {
@@ -76,6 +75,14 @@ export async function getVersion(key: string): Promise<number> {
   const db = await getDb();
   const [row] = await db.select({ v: schema.cacheVersions.version }).from(schema.cacheVersions).where(eq(schema.cacheVersions.key, key));
   return row?.v ?? 0;
+}
+
+/** Several versions in one query, in the order asked (0 for unknown keys). */
+export async function getVersions(keys: string[]): Promise<number[]> {
+  const db = await getDb();
+  const rows = await db.select({ key: schema.cacheVersions.key, v: schema.cacheVersions.version }).from(schema.cacheVersions).where(inArray(schema.cacheVersions.key, keys));
+  const m = new Map(rows.map((r) => [r.key, Number(r.v)]));
+  return keys.map((k) => m.get(k) ?? 0);
 }
 
 export async function bumpVersion(key: string) {

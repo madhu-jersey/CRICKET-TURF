@@ -1,0 +1,34 @@
+# Applies database migrations to production. Manual only: Actions → migrate-production → Run workflow.
+# Deploy order: run this first, then deploy the app (the live server refuses to start if a migration
+# is missing). Uses the PRODUCTION_DATABASE_URL secret of the "production" environment, so the
+# environment's required reviewers (if configured) must approve each run.
+name: migrate-production
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "migrate production" to confirm'
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: migrate-production
+  cancel-in-progress: false
+
+jobs:
+  migrate-production:
+    if: github.event.inputs.confirm == 'migrate production'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "22", cache: npm }
+      - run: npm ci
+      - name: Apply migrations (advisory-locked)
+        env:
+          DATABASE_URL: ${{ secrets.PRODUCTION_DATABASE_URL }}
+        run: npm run deploy:migrate

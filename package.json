@@ -17,7 +17,12 @@
     "test:e2e": "playwright test",
     "test:security": "vitest run tests/security && playwright test tests/security",
     "test:concurrency": "node scripts/test-concurrency.mjs",
-    "test:realdb": "node scripts/test-concurrency.mjs tests"
+    "test:realdb": "node scripts/test-concurrency.mjs tests",
+    "deploy:migrate": "tsx db/cli.ts deploy",
+    "admin:create": "tsx scripts/admin.ts create",
+    "admin:remove-demo": "tsx scripts/admin.ts remove-demo",
+    "admin:recover": "tsx scripts/admin.ts recover",
+    "release:check": "npm run typecheck && npm test && npm run test:realdb && npm run test:concurrency && npx playwright test"
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.5.16",

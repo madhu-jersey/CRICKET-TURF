@@ -153,3 +153,23 @@ test("settings: change a value, save, and it sticks after reload", async ({}, in
   await page.getByTestId("save-settings").click();
   await expect(page.getByText("Settings saved.")).toBeVisible();
 });
+
+// Owner pages used less often at the ground, but still on a phone. One test with soft checks so a
+// run reports every page's problems at once. [SEC-63]
+test("owner pages (overview, pricing, courts, gallery, team, audit, outbox, customers, blocked) load and pass the phone layout check", async ({}, info) => {
+  for (const [path, heading] of [
+    ["/admin", "Overview"],
+    ["/admin/pricing", "Pricing"],
+    ["/admin/courts", "Courts & hours"],
+    ["/admin/gallery", "Gallery"],
+    ["/admin/team", "Team"],
+    ["/admin/audit", "Audit log"],
+    ["/admin/messages", "Message outbox"],
+    ["/admin/customers", "Customers"],
+    ["/admin/blocked", "Blocked slots"],
+  ] as const) {
+    await page.goto(path);
+    await expect(page.getByRole("heading", { name: heading, exact: true }).first()).toBeVisible();
+    if (info.project.name === "mobile") expect.soft(await layoutProblems(page), `${heading} on mobile`).toEqual([]);
+  }
+});

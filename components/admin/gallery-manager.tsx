@@ -93,7 +93,7 @@ export function GalleryManager({ images: initial }: { images: Img[] }) {
       <form onSubmit={upload} className="grid gap-3 rounded-2xl border border-zinc-200 bg-white p-4 sm:grid-cols-[1fr_1fr_160px_auto] sm:items-end sm:p-5">
         <div>
           <Label htmlFor="g-file">Photo (JPG, PNG, WebP · max 4 MB)</Label>
-          <input id="g-file" type="file" accept="image/jpeg,image/png,image/webp,image/avif" required onChange={(e) => setFile(e.target.files?.[0] ?? null)} className="block w-full text-sm file:mr-3 file:rounded-lg file:border-0 file:bg-ink file:px-3 file:py-2 file:text-sm file:font-bold file:text-white" />
+          <input id="g-file" type="file" accept="image/jpeg,image/png,image/webp,image/avif" required onChange={(e) => setFile(e.target.files?.[0] ?? null)} className="min-h-11 py-1 block w-full text-sm file:mr-3 file:rounded-lg file:border-0 file:bg-ink file:px-3 file:py-2 file:text-sm file:font-bold file:text-white" />
         </div>
         <div>
           <Label htmlFor="g-alt">Alt text (describe the photo)</Label>
@@ -144,11 +144,11 @@ export function GalleryManager({ images: initial }: { images: Img[] }) {
                   <option value="PICKLEBALL">Pickleball</option>
                   <option value="FACILITIES">Facilities</option>
                 </Select>
-                <label className="flex items-center gap-1 text-xs font-semibold"><input type="checkbox" checked={img.isFeatured} onChange={(e) => update(img.id, { isFeatured: e.target.checked })} />Featured</label>
+                <label className="flex min-h-11 items-center gap-2 text-xs font-semibold md:min-h-0"><input type="checkbox" className="h-5 w-5" checked={img.isFeatured} onChange={(e) => update(img.id, { isFeatured: e.target.checked })} />Featured</label>
                 <span className="ml-auto flex gap-1">
-                  <button type="button" aria-label="Move earlier" onClick={() => move(img.id, -1)} className="rounded border border-zinc-300 px-2 text-sm">↑</button>
-                  <button type="button" aria-label="Move later" onClick={() => move(img.id, 1)} className="rounded border border-zinc-300 px-2 text-sm">↓</button>
-                  <button type="button" onClick={() => remove(img.id)} className="rounded border border-red-300 px-2 text-xs font-bold text-red-700">Delete</button>
+                  <button type="button" aria-label="Move earlier" onClick={() => move(img.id, -1)} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded border border-zinc-300 px-2 text-sm md:min-h-0 md:min-w-0">↑</button>
+                  <button type="button" aria-label="Move later" onClick={() => move(img.id, 1)} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded border border-zinc-300 px-2 text-sm md:min-h-0 md:min-w-0">↓</button>
+                  <button type="button" onClick={() => remove(img.id)} className="inline-flex min-h-11 items-center rounded border border-red-300 px-3 text-xs font-bold text-red-700 md:min-h-0">Delete</button>
                 </span>
               </div>
             </div>

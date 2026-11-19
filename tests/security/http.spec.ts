@@ -383,3 +383,114 @@ test("SEC-41 recovery codes: shown at first 2FA login, work once, regenerate rep
   expect((await c.post("/api/admin/login/verify", { data: { challengeId: step2.challengeId, recoveryCode: fresh[0] } })).status()).toBe(200);
   await Promise.all([a.dispose(), b.dispose(), c.dispose()]);
 });
+
+test("SEC-44 a gallery upload (database storage) is served back as a clean WebP, and gone after delete", async () => {
+  const { default: sharp } = await import("sharp");
+  const owner = await adminCtx("owner@demo.com");
+  const csrf = await csrfOf(owner);
+  const jpg = await sharp({ create: { width: 400, height: 300, channels: 3, background: "#0b1f14" } }).jpeg().withMetadata({ exif: { IFD0: { Copyright: "secret-location" } } }).toBuffer();
+  const up = await owner.post("/api/admin/gallery", {
+    multipart: { file: { name: "night.jpg", mimeType: "image/jpeg", buffer: jpg }, category: "FACILITIES", alt: "Floodlights at night" },
+    headers: { "x-csrf-token": csrf },
+  });
+  expect(up.status()).toBe(201);
+  const img = await up.json();
+  expect(img.url).toMatch(/^\/api\/files\//);
+
+  const anon = await pwRequest.newContext({ baseURL: BASE });
+  const file = await anon.get(img.url);
+  expect(file.status()).toBe(200);
+  expect(file.headers()["content-type"]).toBe("image/webp");
+  const bytes = await file.body();
+  expect(bytes.subarray(8, 12).toString()).toBe("WEBP");
+  expect(bytes.includes(Buffer.from("secret-location"))).toBe(false); // metadata stripped
+  // The public gallery page links to it.
+  expect(await (await anon.get("/gallery")).text()).toContain(img.url.replace(/\//g, "%2F"));
+
+  // …and the Next.js image optimiser (what the page actually loads) can fetch and resize it.
+  const optimised = await anon.get(`/_next/image?url=${encodeURIComponent(img.url)}&w=640&q=75`);
+  expect(optimised.status()).toBe(200);
+  expect(optimised.headers()["content-type"]).toMatch(/^image\//);
+
+  expect((await owner.delete(`/api/admin/gallery?id=${img.id}`, { headers: { "x-csrf-token": csrf } })).status()).toBe(200);
+  expect((await anon.get(img.url)).status()).toBe(404);
+  await anon.dispose();
+});
+
+const SEED_RULES = (day: number, night: number) => [
+  { startTime: "06:00", endTime: "18:00", pricePerSlot: day },
+  { startTime: "18:00", endTime: "24:00", pricePerSlot: night },
+];
+/** Sets cricket prices for every day type (weekday, weekend, holiday). */
+async function setCricketPrices(owner: APIRequestContext, courtId: string, weekday: [number, number], weekend: [number, number]) {
+  const csrf = await csrfOf(owner);
+  for (const [dayType, [d, n]] of [["WEEKDAY", weekday], ["WEEKEND", weekend], ["HOLIDAY", weekend]] as const) {
+    const r = await owner.put("/api/admin/pricing", { data: { courtId, dayType, rules: SEED_RULES(d, n) }, headers: { "x-csrf-token": csrf } });
+    expect(r.status()).toBe(200);
+  }
+}
+
+test("SEC-60 a price edit shows on the very next availability call (no 12 s stale cache)", async () => {
+  const owner = await adminCtx("owner@demo.com");
+  const courtId = await cricketCourtId(owner);
+  const anon = await pwRequest.newContext({ baseURL: BASE });
+  const date = istDate(5);
+  const daySlot = async () => {
+    const r = await (await anon.get(`/api/availability?courtId=${courtId}&date=${date}`)).json();
+    return (r.slots as { time: string; price: number }[]).find((s) => s.time === "07:00")!.price;
+  };
+  await daySlot(); // warm the cache
+  try {
+    await setCricketPrices(owner, courtId, [913, 1313], [1113, 1513]);
+    expect([913, 1113]).toContain(await daySlot());
+  } finally {
+    await setCricketPrices(owner, courtId, [800, 1200], [1000, 1400]);
+  }
+  await anon.dispose();
+});
+
+test("SEC-61 if the price changes after the grid loaded, the customer sees 'Price updated' and the server's amount, and payment doesn't open by itself", async ({ page }, info) => {
+  const { testPhone } = await import("../e2e/helpers");
+  const owner = await adminCtx("owner@demo.com");
+  const courtId = await cricketCourtId(owner);
+  await page.goto("/book?sport=cricket");
+  await page.waitForLoadState("networkidle"); // hydrated, first availability poll done
+  await page.locator('section[aria-labelledby="h-date"] button').nth(3).click();
+  const time = await page.locator('button[data-fits="true"]').first().getAttribute("data-time");
+  const slot = page.locator(`button[data-time="${time}"]`);
+  await expect(async () => {
+    await slot.click();
+    await expect(slot).toHaveAttribute("aria-pressed", "true", { timeout: 2_000 });
+  }).toPass({ timeout: 15_000 });
+  await page.getByLabel("Your name").fill("Price Watcher");
+  await page.getByLabel("Mobile number").fill(testPhone(info));
+  await page.getByTestId("verify-phone").click();
+  await page.getByLabel("Digit 1").fill((await page.getByTestId("dev-otp-code").textContent())!.trim());
+  await expect(page.getByTestId("phone-verified")).toBeVisible();
+  await page.getByTestId("terms").check();
+  // The total animates up; wait until it stops changing before reading what the customer saw.
+  let shown = "";
+  await expect
+    .poll(async () => {
+      const now = (await page.getByTestId("live-total").textContent())!.trim();
+      const settled = now === shown;
+      shown = now;
+      return settled;
+    }, { intervals: [400] })
+    .toBe(true);
+
+  try {
+    // The owner changes every cricket price while the customer is on the page.
+    await setCricketPrices(owner, courtId, [2000, 2400], [2200, 2600]);
+    await page.getByTestId("hold-button").click();
+    const notice = page.getByTestId("price-updated");
+    await expect(notice).toBeVisible();
+    await expect(notice).toContainText("Price updated");
+    await expect(notice).toContainText(shown); // what we showed before
+    await expect(page.getByTestId("hold-code")).toBeVisible();
+    // Payment must not have opened by itself; the customer decides.
+    await expect(page.getByTestId("mock-success")).toBeHidden();
+  } finally {
+    await setCricketPrices(owner, courtId, [800, 1200], [1000, 1400]);
+  }
+});

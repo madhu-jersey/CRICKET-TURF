@@ -7,6 +7,7 @@ import { getDb, schema } from "@/db/client";
 import { closeTimeSchema, idSchema, timeSchema } from "@/lib/validation";
 import { timeToMinutes } from "@/lib/time";
 import { audit } from "@/lib/audit";
+import { invalidateCourtConfig } from "@/lib/booking/availability-cache";
 
 const body = z.object({
   courtId: idSchema,
@@ -37,5 +38,6 @@ export const PUT = adminRoute("OWNER", async (req, { admin }) => {
       await audit(tx, { actor: admin.email, action: "pricing.update", entity: "Court", entityId: courtId, before: before.map(({ startTime, endTime, pricePerSlot }) => ({ startTime, endTime, pricePerSlot })), after: { dayType: b.dayType, rules: sorted } });
     }
   });
+  await invalidateCourtConfig(courtIds); // new prices show on the next poll [SEC-60]
   return NextResponse.json({ ok: true, courts: courtIds.length });
 });
