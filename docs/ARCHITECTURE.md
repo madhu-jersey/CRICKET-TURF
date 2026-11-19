@@ -1282,7 +1282,7 @@ Runs on every push, pull request and manual dispatch. Global env forces demo mod
 | `unit` | — | typecheck or any Vitest test fails | — |
 | `concurrency` | — (postgres:17 service) | race tests or full real-DB suite fail | — |
 | `e2e` | — | any Playwright test fails | `playwright-traces` on failure |
-| `secrets` | — | gitleaks v8.24.3 finds a leak (full history, `fetch-depth: 0`) | `gitleaks.sarif` |
+| `secrets` | — | gitleaks v8.24.3 finds a leak (full history, `fetch-depth: 0`); `.gitleaks.toml` allowlists only reviewed test fixtures, by exact value and file (SEC-64) | `gitleaks.sarif` |
 | `sast` | — | semgrep (`p/nextjs p/typescript p/secrets p/owasp-top-ten`) reports an ERROR | `semgrep.sarif` |
 | `audit` | — | `npm audit --omit=dev --audit-level=high` finds high/critical | — |
 | `zap` | `unit` | a FAIL rule in `.zap/rules.tsv` fires during the ZAP baseline against the local build | `zap-report`, `zap-server-log` |
@@ -1362,7 +1362,7 @@ The first draft of this document found four defects; fixing them exposed a fifth
 ### Not done or not verified
 
 - Not deployed; no real provider account used (Razorpay, Meta/BSP, MSG91, Turnstile, Supabase, Upstash).
-- CI pushed on 19 Nov 2026; gitleaks, semgrep and ZAP results not yet reviewed (`SECURITY_REPORT.md` §7).
+- CI runs on every push. gitleaks failed on test fixtures until SEC-64; semgrep (no ERROR findings) and ZAP (no FAIL rules) pass, but their WARNING-level reports are artifacts that need a GitHub login and haven't been reviewed (`SECURITY_REPORT.md` §7).
 - Race tests not run against Supabase (only embedded Postgres 17).
 - Staging smoke test written, not run.
 - No error tracking, uptime monitoring or backup automation in the code.

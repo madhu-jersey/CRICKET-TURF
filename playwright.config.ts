@@ -8,7 +8,8 @@ export default defineConfig({
   fullyParallel: false,
   workers: 1, // one embedded DB, and tests book real slots
   retries: 0,
-  reporter: [["list"]],
+  // In CI, also report failures as GitHub annotations (readable without signing in to view logs).
+  reporter: process.env.CI ? [["list"], ["github"]] : [["list"]],
   use: { baseURL: "http://localhost:3100", trace: "retain-on-failure" },
   projects: [
     { name: "desktop", use: { ...devices["Desktop Chrome"] } },

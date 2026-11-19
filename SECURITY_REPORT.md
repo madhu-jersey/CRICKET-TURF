@@ -15,10 +15,10 @@
 | Critical | 1 | 1 | – | – |
 | High | 9 | 9 | – | – |
 | Medium | 24 | 24 | – | – |
-| Low | 20 | 19 | 1 | – |
+| Low | 21 | 20 | 1 | – |
 | Info | – | – | 3 | 1 (Supabase RLS, if used) |
 
-Counts include the follow-up rounds (SEC-33 → SEC-63). Turnstile is no longer "needs owner action": a live server now refuses to start without it.
+Counts include the follow-up rounds (SEC-33 → SEC-64). Turnstile is no longer "needs owner action": a live server now refuses to start without it.
 
 **Overall risk after fixes: Low.** Every Critical, High and Medium issue is fixed and covered by an automated test. The code is **safe to go live once the go-live checklist (§5) is done**. The new startup check refuses to run a live (`DEMO_MODE=false`) server until the critical items are set.
 
@@ -350,6 +350,14 @@ Found while writing `docs/ARCHITECTURE.md` from the code (SEC-44 → SEC-47); SE
 - **Fix:** all at least 44 px on phones (the `sm` button size gets `min-h-11` below `md`); desktop unchanged.
 - **Tests:** `tests/e2e/admin-panels.spec.ts` (one test visits all nine pages on mobile with soft assertions).
 
+### SEC-64 — gitleaks CI job failed on test fixtures · **Low** · Fixed (reviewed allowlist)
+- **Finding:** gitleaks 8.24.3 (the CI version, downloaded locally from the official release and checked against its published SHA-256) scanned all 8 commits and reported 9 `generic-api-key` findings, all test values:
+  - `Temp-Pass-12345` × 7 (`tests/security/http.spec.ts`, `tests/security/followup.test.ts`) and `Floodlit-Turf-2026` × 1 (`tests/security/hardening-p2.test.ts`): passwords of throwaway admin accounts that tests create on the isolated e2e server or in-memory test databases;
+  - `e2e-cron-secret-0123456789` × 1 (`scripts/e2e-server.mjs`): the cron secret of the local Playwright server on port 3100.
+  None is used by any real deployment, so nothing needs rotating.
+- **Fix:** `.gitleaks.toml` keeps the default rules and adds two allowlists on the `generic-api-key` rule, each requiring the exact value **and** the exact file (`condition = "AND"`), with a reason per entry.
+- **Verified:** full-history scan → "no leaks found" (exit 0). Negative control: a fake API key placed in `tests/security/http.spec.ts` is still reported, and the allowlisted test password is still reported when it appears in any other file.
+
 **Also:** `memoryRateLimit()` (dead code) removed; `npm run release:check` added and documented as required before every deploy.
 
 **Tests (after the hardening round, 19 Nov 2026):** Vitest 165 tests — 154 pass + 11 real-Postgres-only skipped on PGlite, **165/165 on real Postgres 17**; race + deploy-migrate suite 11/11; Playwright **37 pass**, 17 skipped (desktop-only tests on the mobile project). Typecheck clean.
@@ -446,7 +454,7 @@ Found while writing `docs/ARCHITECTURE.md` from the code (SEC-44 → SEC-47); SE
 | unit | `npm ci`, typecheck, `npm test` (PGlite) | any test fails | 154 passed, 11 skipped |
 | concurrency | `postgres:17` service; `npm run test:concurrency` and `npm run test:realdb` | any test fails | 11/11 and 165/165 (embedded Postgres 17) |
 | e2e | Playwright desktop + mobile, incl. HTTP security specs | any test fails | 37 passed, 17 skipped (desktop-only) |
-| secrets | gitleaks over the full history (`fetch-depth: 0`) | any leak found | not run locally; regex scan: 0 hits |
+| secrets | gitleaks over the full history (`fetch-depth: 0`), config `.gitleaks.toml` | any leak found | not run locally; regex scan: 0 hits |
 | sast | semgrep `p/nextjs p/typescript p/secrets p/owasp-top-ten` | any ERROR finding | not run locally |
 | audit | `npm audit --omit=dev --audit-level=high` | high/critical advisory | 0 vulnerabilities |
 | zap | ZAP baseline against a local build, rules in `.zap/rules.tsv` | a FAIL-level rule fires | not run locally |
@@ -461,4 +469,4 @@ All jobs use mock providers and throwaway databases; no secrets are needed. Repo
 | semgrep (`p/nextjs p/typescript p/secrets p/owasp-top-ten`, fail on ERROR) | ✅ pass | No ERROR-level findings. WARNING/INFO findings, if any, are only in the `semgrep` artifact (needs a GitHub login to download) — not reviewed. |
 | npm audit (production, high+) | ✅ pass | 0 vulnerabilities |
 | ZAP baseline | ✅ pass | No FAIL-level rule fired. WARN-level alerts are only in the `zap-report` artifact — not reviewed. |
-| **gitleaks (full history)** | ❌ **fail on all three** | gitleaks ran and wrote a 9 KB report, so it found something; the log and the report both need a GitHub login, so the findings are **not known yet**. Local regex scans of the working tree and full history found no real secrets (see §6), so the likely matches are test fixtures (e.g. `e2e-secret-not-for-production-…` in `scripts/e2e-server.mjs`, test-only secrets in `vitest.config.ts` and tests). **Open:** read the findings (gitleaks run locally, or the artifact downloaded by a signed-in maintainer), rotate anything real, and allowlist confirmed test fixtures in a `.gitleaks.toml` with a reason per entry. |
+| **gitleaks (full history)** | ❌ failed on those three runs → ✅ fixed | 9 findings, all test fixtures (SEC-64). Reviewed and allowlisted by exact value + file in `.gitleaks.toml`; a local full-history scan with the CI version is clean. |

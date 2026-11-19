@@ -1,0 +1,25 @@
+# gitleaks configuration: the default rules, plus a narrow allowlist for reviewed test fixtures.
+# Each entry matches an exact value AND a path (condition = "AND"), so a real secret anywhere else —
+# including elsewhere in tests/ — is still reported. Reviewed 19 Nov 2026 (SECURITY_REPORT.md SEC-64).
+# Written for gitleaks 8.24.x (the version CI pins): AND-conditions only work in per-rule allowlists.
+
+[extend]
+useDefault = true
+
+# Extends the default rule; all its other settings are inherited.
+[[rules]]
+id = "generic-api-key"
+
+    [[rules.allowlists]]
+    description = "Passwords of throwaway admin accounts created by tests on the isolated e2e server / in-memory test DBs"
+    condition = "AND"
+    paths = ['''^tests[/\\]security[/\\](http\.spec|followup\.test|hardening-p2\.test|recovery-refund\.test|review-fixes\.test)\.ts$''']
+    regexTarget = "secret"
+    regexes = ['''^Temp-Pass-12345$''', '''^Floodlit-Turf-2026$''', '''^Night-Match-2026!$''']
+
+    [[rules.allowlists]]
+    description = "Secrets of the local Playwright test server (localhost:3100, mock providers); never used anywhere else"
+    condition = "AND"
+    paths = ['''^scripts[/\\]e2e-server\.mjs$''']
+    regexTarget = "secret"
+    regexes = ['''^e2e-(cron-)?secret-''']
