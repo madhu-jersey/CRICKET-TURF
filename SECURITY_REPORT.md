@@ -2,7 +2,7 @@
 
 **Scope:** full codebase review + testing of the Next.js turf booking site (box cricket + pickleball): public booking with phone OTP, ₹ advance payment (Razorpay / mock), WhatsApp messaging, owner/staff dashboard.
 **Environment:** local only — embedded Postgres (PGlite, real Postgres 17 with the real migrations), mock OTP / WhatsApp / payment providers, isolated production build on `localhost:3100`. No production systems, real payment accounts or real phone numbers were used.
-**Date:** 18 Nov 2026 · **Version tested:** `main` + the fixes in this report. **Follow-up round (SEC-33 → SEC-40):** same day, branch `security-review`; real Postgres 17 (embedded, 25 connections) added for race testing. **Third round (SEC-41 → SEC-43):** 19 Nov 2026 — admin recovery codes, admin pages tested on a phone screen, fresh code for refund cancels. **Fourth round (SEC-44 → SEC-48):** same day — defects found while writing `docs/ARCHITECTURE.md`.
+**Date:** 18 Nov 2026 · **Version tested:** `main` + the fixes in this report. **Follow-up round (SEC-33 → SEC-40):** same day, branch `security-review`; real Postgres 17 (embedded, 25 connections) added for race testing. **Third round (SEC-41 → SEC-43):** 19 Nov 2026 — admin recovery codes, admin pages tested on a phone screen, fresh code for refund cancels. **Fourth round (SEC-44 → SEC-48):** same day — defects found while writing `docs/ARCHITECTURE.md`. **Hardening round (SEC-49 onward):** branch `security-hardening`, the remaining risks from `docs/ARCHITECTURE.md` §15.
 
 > Note: this site **keeps online advance payment** (owner decision), so the review covers both the "no payment" checklist (booking abuse, OTP flooding, access control) and the payment checks (fake/forged/replayed payments, refunds).
 
@@ -275,6 +275,22 @@ Found while writing `docs/ARCHITECTURE.md` from the code (SEC-44 → SEC-47); SE
 - **Proof:** the SEC-47 test on Postgres 17 failed with `ERR_INVALID_ARG_TYPE` from `createBlocks()`: a JavaScript `Date` was embedded in a raw `sql` fragment. PGlite (used by `npm test` and the e2e server) accepts it; postgres-js (production) does not. On a live site the owner could not block any slot.
 - **Fix:** the overlap check uses typed Drizzle operators (`or` / `and` / `gt`). No other raw `sql` fragment embeds a date.
 - **Tests:** `races.test.ts` exercises `createBlocks()` on Postgres 17 (CI `concurrency` job). Lesson recorded in `docs/ARCHITECTURE.md` §15: run `npm run test:realdb` before every release, not only `npm test`.
+
+### Hardening round — P1: money and OTP (SEC-49 → SEC-51)
+
+### SEC-49 — A refund retry after a timeout could refund twice · **High** · Fixed
+- **Proof:** `refundSinglePayment()` released its reservation whenever the provider call threw. A timeout (or network error, or Razorpay 5xx) can mean Razorpay already made the refund, so the cron's retry would refund again — for a full refund the reservation guard stopped the second one only because nothing was left, but for partial refunds (e.g. a 50 % policy) a second refund fitted within the captured amount. Pending refunds were also retried forever.
+- **Fix:** every gateway refund gets a fresh key (`rf_…`), stored on the Payment with the amount and time **before** the call (the same atomic update that reserves the amount, and only if no other refund of that payment is in flight). The key goes to Razorpay as `receipt` and `notes.refund_key`. Timeouts, network errors and 5xx raise `ProviderOutcomeUnknown`: the reservation and key are **kept**. The cron's new `reconcileInFlightRefunds()` (in-flight refunds older than 1 minute) calls `GET /v1/payments/{id}/refunds` and matches the key: found → recorded as done; not found → reservation released, then retried normally. 4xx answers are definite failures and release at once. Pending refunds give up after 20 failed attempts or 24 hours: the booking is marked `refundNeedsManual` (migration 0009), retries stop, the owner gets one alert, and the Overview shows "Refunds needing attention" with a "Mark refunded" action (owner, audit-logged `booking.refund_marked_manual`).
+- **Tests:** `tests/security/hardening-p1.test.ts › SEC-49` — timeout but the refund exists → found by key, provider called once (also when the retry runs before the reconcile); timeout and no refund → released and retried exactly once; in-flight refunds younger than a minute untouched; 20 failures → needs manual, exactly 20 provider calls, one alert, owner records it; 24 h → needs manual.
+
+### SEC-50 — OTP fallback to SMS took up to ~48 s when WhatsApp was failing · **Medium** · Fixed
+- **Proof:** WhatsApp OTPs went through the outbox's three attempts with 15 s timeouts and 1 s + 2 s backoff sleeps before `deliverOtpCode()` could fall back to SMS.
+- **Fix:** OTPs use `dispatchOnce()`: one attempt with a 5 s deadline (`OTP_WHATSAPP_TIMEOUT_MS`), no sleeps; then SMS straight away. Other messages keep the background retries.
+- **Tests:** `hardening-p1.test.ts › SEC-50` — a WhatsApp provider that hangs for 10 s: SMS is called between 4.5 s and 6.5 s, the whole request finishes in under 8 s, the outbox row is `FAILED` after 1 attempt.
+
+### SEC-51 — `/api/files/[id]` served any stored image and had no rate limit · **Low** · Fixed
+- **Fix:** files are served only if a `GalleryImage` row points at them (`storageKey = 'db:<id>'`); 300 requests per minute per network (shared fixed window) → 429 with `Retry-After`.
+- **Tests:** `hardening-p1.test.ts › SEC-51` — a StoredFile with no gallery entry is 404 and is served once it belongs to the gallery; 300 requests pass, the 301st is 429, another network is unaffected.
 
 ### SEC-28 — Dev dependency advisory (picomatch ReDoS via vitest) · **Low** · Fixed (resolved upstream)
 - Earlier: 5 high advisories in `picomatch` inside the test runner. Re-checked 18 Nov 2026: `npm audit` and `npm audit --omit=dev` both report **0 vulnerabilities**. CI now fails on any high advisory in production dependencies.

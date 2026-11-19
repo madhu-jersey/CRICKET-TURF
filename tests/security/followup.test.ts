@@ -157,7 +157,10 @@ describe("SEC-37 shared availability limiter + cache", () => {
     const a = new PgCounterStore();
     const b = new PgCounterStore();
     const results: boolean[] = [];
-    for (let i = 0; i < 6; i++) results.push(await windowLimit("avail-test", 4, 60_000, NOW, i % 2 ? a : b));
+    // Real "now": the store's cleanup compares against the real clock, so a stale timestamp could see
+    // its window deleted mid-test on a slow run.
+    const now = new Date();
+    for (let i = 0; i < 6; i++) results.push(await windowLimit("avail-test", 4, 60_000, now, i % 2 ? a : b));
     expect(results.filter(Boolean)).toHaveLength(4);
     const rows = await db.select().from(schema.counters);
     expect(rows.filter((r) => r.key.startsWith("avail-test"))).toHaveLength(1); // one row per window, not per request

@@ -15,6 +15,7 @@ import { getPaymentProvider, setPaymentProviderOverride, webhookSignature, type 
 import { MockProvider, setMessagingProviderOverride } from "@/lib/providers/messaging";
 import { cancelBooking, createOnlineHold, handlePaymentWebhook, refundCancelledBooking, retryPendingRefunds } from "@/lib/booking/service";
 import { getBookingByCode, listCourts } from "@/lib/booking/data";
+import { AppError } from "@/lib/errors";
 import { sendOtp } from "@/lib/otp-service";
 import { issueAdminCode } from "@/lib/auth/admin-core";
 import { storeImage } from "@/lib/storage";
@@ -64,11 +65,12 @@ function flakyRefunds() {
     createOrder: (i) => real.createOrder(i),
     verifyCheckoutSignature: (i) => real.verifyCheckoutSignature(i),
     verifyWebhookSignature: (b, s) => real.verifyWebhookSignature(b, s),
-    refund: async () => {
+    refund: async (i) => {
       state.calls++;
-      if (state.failing) throw new Error("Razorpay: gateway timeout (simulated)");
-      return real.refund();
+      if (state.failing) throw new AppError("PROVIDER_ERROR", "Razorpay: BAD_REQUEST_ERROR (simulated)");
+      return real.refund(i);
     },
+    listRefunds: (id) => real.listRefunds(id),
   };
   setPaymentProviderOverride(p);
   return state;
@@ -125,7 +127,7 @@ describe("SEC-45 failed refunds are recorded and retried", () => {
     const state = flakyRefunds();
     const r = await cancelBooking({ bookingId: id, actor: "customer", by: "CUSTOMER", refund: { mode: "POLICY" }, freshOtp: true });
     expect(r).toMatchObject({ status: "CANCELLED", refunded: 0 });
-    expect(r.refundError).toMatch(/gateway timeout/);
+    expect(r.refundError).toMatch(/BAD_REQUEST_ERROR/);
     expect((await getBookingByCode(h.bookingCode))!.booking.refundPendingAmount).toBe(300);
 
     // Provider failing: the owner's manual refund reports the error and changes nothing.
@@ -163,7 +165,7 @@ describe("SEC-46 OTP delivery failures surface instead of 'code sent'", () => {
     expect(row.consumedAt).not.toBeNull();
     const [m] = await db.select().from(schema.messageLogs).where(eq(schema.messageLogs.phone, "+919876544101"));
     expect(m.status).toBe("FAILED");
-    expect(m.attempts).toBe(3);
+    expect(m.attempts).toBe(1); // one try with a 5 s deadline, then give up (SEC-50)
   });
 
   it("WhatsApp down with MSG91 configured: the customer's code goes by SMS", async () => {
@@ -193,6 +195,8 @@ describe("SEC-44 gallery files stored in the database are served", () => {
     const stored = await storeImage(new File([new Uint8Array(png)], "pitch.png", { type: "image/png" }));
     expect(stored.url).toMatch(/^\/api\/files\/[0-9a-f-]{36}$/);
     const id = stored.url.split("/").pop()!;
+    // Only files that belong to a gallery image are served (SEC-51).
+    await db.insert(schema.galleryImages).values({ url: stored.url, storageKey: stored.key, category: "FACILITIES", alt: "Pitch at night" });
 
     const res = await getFile(new Request(`http://localhost${stored.url}`), { params: Promise.resolve({ id }) });
     expect(res.status).toBe(200);

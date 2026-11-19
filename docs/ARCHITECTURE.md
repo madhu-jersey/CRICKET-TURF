@@ -284,6 +284,7 @@ Tables with no foreign keys (stand-alone): `OtpRequest`, `AuditLog`, `RateLimitH
 | balancePaidAt | timestamptz | |
 | refundAmount | integer | default 0 |
 | refundPendingAmount | integer | ≥ 0 (0008); refund still owed after a failed refund call, retried by the cron |
+| refundPendingSince, refundAttempts, refundNeedsManual | timestamptz, integer, boolean | give-up state for pending refunds: 24 h or 20 attempts → needs manual refund (0009) |
 | source | text | CHECK in (`ONLINE`, `WALK_IN`, `PHONE`) |
 | holdExpiresAt | timestamptz | set while `PENDING_PAYMENT` |
 | cancelledAt, cancelReason | | |
@@ -306,6 +307,7 @@ Indexes: (`courtId`, `startAt`), (`customerId`), (`status`, `holdExpiresAt`), (`
 | refundAmount | integer | ≥ 0, CHECK refundAmount ≤ amount |
 | paidAt, refundedAt | timestamptz | |
 | rawWebhookPayload | jsonb | minimal subset only (SEC-17) |
+| refundInFlightKey, refundInFlightAmount, refundInFlightAt | text, integer, timestamptz | a refund call whose outcome is unknown: its key (sent to Razorpay as `receipt` and `notes.refund_key`), reserved amount and start time (0009) |
 
 Indexes: (`bookingId`), (`paidAt`).
 
@@ -372,7 +374,7 @@ Advisory locks (`pg_advisory_xact_lock(hashtext(key))`, released at transaction 
 | `offer:<deviceId>` | `createOnlineHold()` | Only one hold per device can claim the first-booking offer |
 | `rl:<key>` | `lib/ratelimit.ts › hitRateLimit()` | Exact sliding-window counts under bursts (SEC-07) |
 
-Compare-and-set updates: `Payment.refundAmount + x ≤ amount` reserves a refund before the provider is called (`refundSinglePayment()`); `Booking.refundPendingAmount` is claimed by setting it to 0 only if unchanged (`retryPendingRefunds()`) (SEC-45).
+Compare-and-set updates: `Payment.refundAmount + x ≤ amount` **and no refund in flight** reserves a refund and stores its key before the provider is called (`refundSinglePayment()`, SEC-49); `Booking.refundPendingAmount` is claimed by setting it to 0 only if unchanged (`retryPendingRefunds()`) (SEC-45).
 
 Row locks (`SELECT … FOR UPDATE`): Customer row in `upsertCustomer()`; Payment then Booking in `confirmPayment()`; Booking in `cancelBooking()`, `markBalancePaid()`, `setBookingOutcome()`.
 
@@ -388,6 +390,7 @@ Row locks (`SELECT … FOR UPDATE`): Customer row in `upsertCustomer()`; Payment
 | `0006_followup_hardening.sql` | `Counter`, `CacheVersion`, `AdminCode`; split OTP caps + boost; per-IP limit settings; `cancelCutoffHours`, `refundPercentAfterCutoff`; renames `cancellationCutoffHours` → `refundCutoffHours`; drops `otpDailyCap`; `Customer.trustEpoch`; admin phone, forced change, trust epoch |
 | `0007_admin_recovery_codes.sql` | `AdminRecoveryCode`; `AdminUser.recoveryCodesAt` |
 | `0008_pending_refunds.sql` | `Booking.refundPendingAmount` (≥ 0) + partial index |
+| `0009_refund_reconcile.sql` | Payment in-flight refund key/amount/time; Booking `refundPendingSince`, `refundAttempts`, `refundNeedsManual` |
 
 The runner wraps each file in `BEGIN … COMMIT` together with its `_migrations` insert. There are no down migrations.
 
@@ -456,7 +459,7 @@ stateDiagram-v2
 | → PAID (online) | Row-locked in `confirmPayment()`; stores `providerPaymentId` and a minimal webhook payload | |
 | → PAID (offline) | Walk-in with amount > 0 (`kind = ADVANCE`), or "mark balance paid" (`kind = BALANCE`) | `createAdminBooking()`, `markBalancePaid()` |
 | CREATED → FAILED | Only from `CREATED`; sends the "payment failed, hold expiring" message if the hold is still live | `markPaymentFailed()` |
-| PAID → REFUNDED | `refundSinglePayment()` when cumulative `refundAmount ≥ amount` | The amount is reserved on the row before the provider call and released if the call fails, so concurrent refunds can't exceed the payment |
+| PAID → REFUNDED | `refundSinglePayment()` when cumulative `refundAmount ≥ amount` | The amount is reserved (with a refund key) before the provider call. A definite failure (4xx) releases it; an unknown outcome (timeout, network, 5xx) keeps it until the cron finds the refund by key or confirms it doesn't exist (SEC-49) |
 
 An open `CREATED` order is reused only if it has the same provider and the same amount as the current advance.
 
@@ -553,7 +556,7 @@ Send (`app/api/otp/send/route.ts`, `lib/otp-service.ts › sendOtp()`):
 5. **Per network:** `otp-send-ip:<ip>` `Settings.otpSendPerIpHour` (default 30) per hour.
 6. **Daily cap pool:** "returning" if the number has a `CONFIRMED`/`COMPLETED` booking starting within the last 90 days (or upcoming); otherwise "new". Cap = `otpDailyCapNew` (200) or `otpDailyCapReturning` (300), plus `otpCapBoost` if `otpCapBoostDate` is today (IST). The counter `otpcap:<pool>:<IST date>` is incremented first. At ≥ 80 % and at ≥ 100 % the owner gets one alert each per pool per day. If the new count is above the cap → 429 "We can't send codes right now. Please call the venue to book."
 7. Older unused codes for the phone are marked consumed. A new row stores `HMAC-SHA256(APP_SECRET, "otp:<phone>:<code>")`, `expiresAt = now + 5 min`, and the IP.
-8. `lib/providers/otp.ts › deliverOtpCode()` sends the code over `OTP_PROVIDER`. If that channel fails (WhatsApp: all 3 outbox attempts failed) and `MSG91_AUTH_KEY` + `MSG91_OTP_TEMPLATE_ID` are set, the code goes by SMS instead. If every channel fails, the new code is withdrawn (marked consumed) and the customer gets 502 `PROVIDER_ERROR` instead of "code sent" (SEC-46). The mock returns `devCode`, which the demo UI shows.
+8. `lib/providers/otp.ts › deliverOtpCode()` sends the code over `OTP_PROVIDER`. WhatsApp gets **one** attempt with a 5-second deadline and no backoff (`lib/messaging/index.ts › dispatchOnce()`, SEC-50). If that channel fails and `MSG91_AUTH_KEY` + `MSG91_OTP_TEMPLATE_ID` are set, the code goes by SMS instead. If every channel fails, the new code is withdrawn (marked consumed) and the customer gets 502 `PROVIDER_ERROR` instead of "code sent" (SEC-46). The mock returns `devCode`, which the demo UI shows.
 
 Verify (`app/api/otp/verify/route.ts`, `verifyOtp()`):
 
@@ -636,7 +639,7 @@ sequenceDiagram
    - booking already live, or cancelled/refunded/no-show → `REFUND_NOT_BOOKABLE`.
 6. After commit: confirmed → queue confirmation + owner alert. Refund outcomes → `refundSinglePayment()` for the full payment; if the booking wasn't live it becomes `REFUNDED` and the customer gets the cancellation message.
 
-Failure paths: the refund runs after the transaction commits. If the refund call fails, the webhook still returns 200 (a Razorpay retry would see `ALREADY_PROCESSED` and could never refund), and the money owed is recorded in `Booking.refundPendingAmount` with a `booking.refund_failed` audit entry and an owner alert. The booking stays `CANCELLED` until the cron's retry succeeds; then it becomes `REFUNDED` and the customer gets the cancellation message (SEC-45).
+Failure paths: the refund runs after the transaction commits, with a stored refund key. If the refund call fails or its outcome is unknown, the webhook still returns 200 (a Razorpay retry would see `ALREADY_PROCESSED` and could never refund), and the money owed is recorded in `Booking.refundPendingAmount` with a `booking.refund_failed` audit entry and an owner alert. The booking stays `CANCELLED` until the cron's retry succeeds; then it becomes `REFUNDED` and the customer gets the cancellation message (SEC-45).
 
 ### 6.5 Hold expiry and reminder crons
 
@@ -644,7 +647,9 @@ Failure paths: the refund runs after the transaction commits. If the refund call
 2. `GET /api/cron/send-reminders` (every 15 min): `expireHolds()` again (safety net), then `sendReminders()`, then `redispatchStuck()`, then `retryPendingRefunds()`.
    - `sendReminders()` claims bookings with one `UPDATE … SET reminderSentAt = now WHERE status = CONFIRMED AND reminderSentAt IS NULL AND startAt in (now, now + 2 h] RETURNING id`, so two overlapping runs can't both send. Each gets a `booking_reminder` message (dedupe key `booking_reminder:<id>`), only if opted in.
    - `redispatchStuck()` re-sends up to 50 messages stuck in `QUEUED` for more than 2 minutes. Masked OTP messages are marked `FAILED` ("Expired before delivery") instead.
-   - `retryPendingRefunds()` takes up to 20 bookings with `refundPendingAmount > 0`. Each is claimed by setting the amount to 0 only if unchanged (so overlapping runs can't both refund), refunded online-first, and whatever still fails is put back with another owner alert (one per booking per day). Success adds to `refundAmount`, sets `REFUNDED` for cancelled/expired bookings and sends `booking_cancelled` (SEC-45).
+   - `reconcileInFlightRefunds()` (runs first) takes refunds whose outcome was unknown and are older than 1 minute, lists the payment's refunds at Razorpay (`GET /v1/payments/{id}/refunds`) and matches our key: found → recorded as refunded; not found → the reservation is released so the retry below can try again; lookup failed → next run (SEC-49).
+   - `retryPendingRefunds()` takes up to 20 bookings with `refundPendingAmount > 0` that haven't given up. After 20 failed attempts or 24 hours since the first failure it marks the booking `refundNeedsManual`, stops retrying and sends the owner one alert; the Overview page then shows it under "Refunds needing attention" with a "Mark refunded" button (owner, audit-logged, `markRefundedManually()`).
+   - Otherwise it claims each pending amount by setting it to 0 only if unchanged (so overlapping runs can't both refund), refunds it online-first, and puts back whatever still fails, counting the attempt, with another owner alert (one per booking per day). Success adds to `refundAmount`, sets `REFUNDED` for cancelled/expired bookings and sends `booking_cancelled` (SEC-45).
 3. Correctness never depends on the crons: availability treats expired holds as free, and inserts expire overlapping stale holds themselves.
 
 ### 6.6 Customer cancellation
@@ -779,7 +784,7 @@ flowchart LR
 
 1. `lib/messaging/index.ts › enqueueMessage()` writes a `QUEUED` row only if `optedIn` is true. Customer messages pass the customer's `whatsappOptIn`; owner alerts and OTPs pass `true`.
 2. Params are cleaned (`templates.ts › cleanParam()`: single line, names stripped of links and `<>{}`, max 120 chars, or 200 for `text`/`policy`). OTP codes are stored masked (`••••••`) when the WhatsApp OTP provider is used.
-3. `dispatchMessage()` tries up to 3 times (`MAX_MESSAGE_ATTEMPTS`), sleeping `MESSAGE_RETRY_BASE_MS × 2^(n−1)` between tries (1 s, then 2 s by default). Each try updates `attempts` and `error`, and the function returns the final status (`SENT`, `MOCKED` or `FAILED`). A failed message never fails a booking; only OTP delivery treats `FAILED` as an error (SEC-46).
+3. `dispatchMessage()` tries up to 3 times (`MAX_MESSAGE_ATTEMPTS`), sleeping `MESSAGE_RETRY_BASE_MS × 2^(n−1)` between tries (1 s, then 2 s by default). Each try updates `attempts` and `error`, and the function returns the final status (`SENT`, `MOCKED` or `FAILED`). A failed message never fails a booking; only OTP delivery treats `FAILED` as an error (SEC-46), and OTPs use `dispatchOnce()` (one try, 5 s deadline) so the SMS fallback starts quickly (SEC-50).
 4. Providers: mock (status `MOCKED`), Meta Cloud API, generic BSP (section 12). Templates: `otp_code`, `booking_confirmed`, `booking_reminder`, `booking_cancelled`, `payment_failed_hold_expiring`, `admin_new_booking`, `admin_alert`, each in English and Telugu (`MESSAGE_LANGUAGE`).
 5. Owner alerts (`lib/alerts.ts › alertOwner(kind, text)`): one `admin_alert` per kind per IST day (dedupe key `alert:<kind>:<date>`), only if `Settings.ownerAlertPhone` is set; also audit `security.<kind>`. Kinds in use: `otp_cap_new_80/100`, `otp_cap_returning_80/100`, `booking_flood`, and per-event kinds for password changes and recovery-code use (these include a timestamp so each one is sent).
 6. Admin "Retry" (`POST /api/admin/messages/[id]/retry`, owner) resets attempts and dispatches again. Masked OTP rows can't be retried.
@@ -791,7 +796,7 @@ flowchart LR
 2. `lib/storage.ts › storeImage()`: max 4 MB; magic-byte sniffing (JPEG, PNG, WebP, AVIF); `sanitizeImage()` re-encodes with `sharp`: rejects over 40 MP and under 200 × 200 px, applies EXIF rotation, resizes to fit 2400 × 2400, outputs WebP quality 82 with all metadata dropped.
 3. Storage: `STORAGE_PROVIDER=db` (default) stores bytes in `StoredFile` and returns URL `/api/files/<id>`; `supabase` uploads to `SUPABASE_URL/storage/v1/object/<bucket>/<path>` with the service-role key and returns the public URL.
 4. A `GalleryImage` row is added at the end of the order; audit `gallery.upload`. PATCH edits alt/category/featured, PUT reorders (≤ 500 ids), DELETE removes the row and the stored object.
-5. **Serving:** `GET /api/files/[id]` (`app/api/files/[id]/route.ts`) serves `db` images: the id must be a UUID, only `image/*` rows are served, with `Cache-Control: public, max-age=31536000, immutable`, `nosniff`, a `default-src 'none'` CSP and `Cross-Origin-Resource-Policy: same-origin` (SEC-44). Supabase images are served by Supabase; `next.config.ts` allows `*.supabase.co/storage/v1/object/public/**` for `next/image`. Seed images use Unsplash URLs.
+5. **Serving:** `GET /api/files/[id]` (`app/api/files/[id]/route.ts`) serves `db` images: 300 requests per minute per network (fixed window, SEC-51), the id must be a UUID, the file must belong to a `GalleryImage` row (join on `storageKey = 'db:<id>'`, SEC-51), only `image/*` rows are served, with `Cache-Control: public, max-age=31536000, immutable`, `nosniff`, a `default-src 'none'` CSP and `Cross-Origin-Resource-Policy: same-origin` (SEC-44). Supabase images are served by Supabase; `next.config.ts` allows `*.supabase.co/storage/v1/object/public/**` for `next/image`. Seed images use Unsplash URLs.
 
 ---
 
@@ -941,11 +946,11 @@ All handlers are in `app/api/**/route.ts`, wrapped by `lib/errors.ts › handle(
 | POST `/api/payments/verify` | checkout HMAC | — | orderId, paymentId, signature | `{bookingCode, outcome}` | `app/api/payments/verify/route.ts` |
 | POST `/api/payments/mock/simulate` | demo/dev only (404 otherwise) | — | orderId, outcome | signed webhook into the real handler + signed checkout response | `app/api/payments/mock/simulate/route.ts` |
 | POST `/api/webhooks/razorpay` | webhook HMAC | — | raw Razorpay event | `{ok, duplicate}`; confirm / fail / refund | `app/api/webhooks/razorpay/route.ts` |
-| GET `/api/files/[id]` | none | — | UUID | gallery image bytes (WebP), cached for a year | `app/api/files/[id]/route.ts` |
+| GET `/api/files/[id]` | none | 300/min per IP (fixed window) | UUID of a gallery file | gallery image bytes (WebP), cached for a year | `app/api/files/[id]/route.ts` |
 | GET `/api/my-bookings` | `bba_vp` | — | — | up to 100 bookings, newest first | `app/api/my-bookings/route.ts` |
 | GET/POST `/api/my-bookings/whatsapp` | `bba_vp` | — | POST `{optIn}` | opt-in state; audit | `app/api/my-bookings/whatsapp/route.ts` |
 | GET `/api/cron/expire-holds` | Bearer `CRON_SECRET` | — | — | `{expired}` | `app/api/cron/expire-holds/route.ts` |
-| GET `/api/cron/send-reminders` | Bearer `CRON_SECRET` | — | — | `{reminders, expired, redispatched, refundsRetried}` | `app/api/cron/send-reminders/route.ts` |
+| GET `/api/cron/send-reminders` | Bearer `CRON_SECRET` | — | — | `{reminders, expired, redispatched, refundsReconciled, refundsRetried}` | `app/api/cron/send-reminders/route.ts` |
 
 ### Admin (all under `adminRoute()` unless marked)
 
@@ -962,7 +967,7 @@ All handlers are in `app/api/**/route.ts`, wrapped by `lib/errors.ts › handle(
 | GET `/api/admin/availability` | STAFF | — | courtId, date | admin grid (started slots allowed) | `app/api/admin/availability/route.ts` |
 | POST `/api/admin/walk-in` | STAFF | — | walkInSchema | CONFIRMED booking (+ Payment) | `app/api/admin/walk-in/route.ts` |
 | GET `/api/admin/bookings/[id]` | STAFF | — | — | booking details | `app/api/admin/bookings/[id]/route.ts` |
-| POST `/api/admin/bookings/[id]` | STAFF; refunds OWNER | resend 3/h per booking | `action`: balance_paid, complete, no_show, resend, cancel (refundMode FULL/PARTIAL/NONE, amount, reason), refund (amount) | per action | same |
+| POST `/api/admin/bookings/[id]` | STAFF; refunds OWNER | resend 3/h per booking | `action`: balance_paid, complete, no_show, resend, cancel (refundMode FULL/PARTIAL/NONE, amount, reason), refund (amount), mark_refunded_manually (owner) | per action | same |
 | GET `/api/admin/bookings/export` | OWNER | — | same filters as the list | CSV with BOM, formula-safe | `app/api/admin/bookings/export/route.ts` |
 | POST/DELETE `/api/admin/blocks` | OWNER | — | court, date/time range, reason, note, `repeatWeekly` 0–26 extra weeks; DELETE by `id` or `group` | blocks (refused if overlapping a live booking); cache invalidated | `app/api/admin/blocks/route.ts` |
 | PATCH `/api/admin/courts` | OWNER | — | id, name?, isActive?, hours[]? | court + hours | `app/api/admin/courts/route.ts` |
@@ -1025,6 +1030,9 @@ Every admin write is audit-logged (`lib/audit.ts`).
 | Honest OTP delivery + SMS fallback | "Code sent" when it wasn't; admin lockout when WhatsApp is down | `lib/providers/otp.ts › deliverOtpCode()` | MSG91 keys | SEC-46 |
 | Blocks under the court-day lock | A booking landing under a new block | `createBlocks()`, `assertNotBlocked()` | — | SEC-47 |
 | Typed date comparison in block check | Block creation crashing on real Postgres | `createBlocks()` | — | SEC-48 |
+| Refund keys, reconcile, give-up | Double refunds after timeouts; endless retries | `refundSinglePayment()`, `reconcileInFlightRefunds()`, `retryPendingRefunds()`, `markRefundedManually()` | — | SEC-49 |
+| One-try WhatsApp OTP | ~48 s wait before SMS fallback | `dispatchOnce()`, `OTP_WHATSAPP_TIMEOUT_MS` | — | SEC-50 |
+| Gallery-only file serving + limit | Serving orphan files; DB hammering | `app/api/files/[id]/route.ts` | — | SEC-51 |
 
 ### Rate limits
 
@@ -1056,6 +1064,7 @@ Two mechanisms exist:
 | `admin-reset-verify-ip:<ip>` | IP | 20 | 1 h | sliding | — |
 | `resend:<bookingId>` | booking | 3 | 1 h | sliding | — |
 | `iplog:<kind>:<ip>` | IP | 1 audit entry | 1 h | fixed | — |
+| `files:<ip>` | IP | 300 | 60 s | fixed | — |
 | OTP / admin code attempts | code | 5 | per code | row counter | — |
 
 `lib/ratelimit.ts › memoryRateLimit()` (per-instance, in-memory) still exists but nothing calls it.
@@ -1201,12 +1210,12 @@ Background work inside requests (`runInBackground()`) uses `after()`, so on Verc
 
 | Adapter | File | API | Auth | Timeout / retries | Failure handling |
 |---|---|---|---|---|---|
-| `RazorpayProvider` | `lib/providers/payment.ts` | `POST /v1/orders`, `POST /v1/payments/{id}/refund` (`speed: normal`) | HTTP Basic key id:secret | 15 s, no retry | `PROVIDER_ERROR` (502). Order failure leaves the hold; "Retry payment" re-creates. Refund failure → `refundPendingAmount`, audit, owner alert, cron retry every 15 min |
+| `RazorpayProvider` | `lib/providers/payment.ts` | `POST /v1/orders`, `POST /v1/payments/{id}/refund` (`speed: normal`, `receipt` + `notes.refund_key`), `GET /v1/payments/{id}/refunds` | HTTP Basic key id:secret | 15 s, no retry | Timeouts, network errors and 5xx are `ProviderOutcomeUnknown`; 4xx are definite failures. Order failure leaves the hold; "Retry payment" re-creates. Refund failure → `refundPendingAmount`, audit, owner alert; unknown outcomes are reconciled by key; retries every 15 min until 20 attempts / 24 h |
 | `MockPaymentProvider` | same | none | secrets derived from `APP_SECRET` | — | — |
 | `MetaCloudProvider` | `lib/providers/messaging.ts` | `POST graph.facebook.com/<version>/<phone id>/messages`, template message; `otp_code` adds the copy-code button param | Bearer token | 15 s; 3 tries by the outbox | Row `FAILED` with error text |
 | `GenericBspProvider` | same | `POST BSP_API_URL` with `{countryCode, phoneNumber, type: Template, template{name, languageCode, bodyValues}}` | `<BSP_AUTH_HEADER>: <prefix><key>` | 15 s; 3 tries | same |
 | `MockProvider` (messaging) | same | none | — | — | status `MOCKED` |
-| `WhatsAppOtp` | `lib/providers/otp.ts` | messaging provider | — | outbox retries inline (3 tries) | throws `PROVIDER_ERROR` when all tries fail; `deliverOtpCode()` then tries SMS |
+| `WhatsAppOtp` | `lib/providers/otp.ts` | messaging provider | — | one try, 5 s deadline (`dispatchOnce()`) | throws `PROVIDER_ERROR`; `deliverOtpCode()` then tries SMS |
 | `SmsOtp` | same | `POST control.msg91.com/api/v5/flow` | `authkey` header | 15 s, no retry | `PROVIDER_ERROR` to the caller |
 | `MockOtp` | same | none | — | — | refused live |
 | Turnstile | `lib/turnstile.ts` | `POST challenges.cloudflare.com/turnstile/v0/siteverify` | secret | 8 s | fails closed |
@@ -1301,7 +1310,7 @@ All jobs except `zap` run in parallel.
 
 | Incident | Check | Fix |
 |---|---|---|
-| Payment taken, booking not confirmed | Razorpay dashboard: payment captured? Webhook deliveries to `/api/webhooks/razorpay` (status codes). `Payment` row for the order: still `CREATED`? Audit `payment.*` for the booking. | Re-send the webhook from Razorpay. If the booking is `EXPIRED` and the slot is free, the next captured event confirms it late; if the slot was taken it is refunded. If a refund failed, the booking drawer shows "Refund pending": the cron retries it every 15 minutes; the owner can also use "Refund" (that settles the pending amount, so the cron won't pay it again). |
+| Payment taken, booking not confirmed | Razorpay dashboard: payment captured? Webhook deliveries to `/api/webhooks/razorpay` (status codes). `Payment` row for the order: still `CREATED`? Audit `payment.*` for the booking. | Re-send the webhook from Razorpay. If the booking is `EXPIRED` and the slot is free, the next captured event confirms it late; if the slot was taken it is refunded. If a refund failed, the booking drawer shows "Refund pending": the cron retries it every 15 minutes (after a timeout it first checks Razorpay for the refund by key, so it never pays twice); after 20 attempts or 24 hours it appears on the Overview under "Refunds needing attention" — refund it in the Razorpay dashboard, then press "Mark refunded"; the owner can also use "Refund" (that settles the pending amount, so the cron won't pay it again). |
 | Webhook failing | 400 = signature (wrong `RAZORPAY_WEBHOOK_SECRET` or body altered by a proxy); 404 = unknown order (wrong environment/keys); 500 = check logs. | Fix the secret; the checkout callback still confirms bookings meanwhile. |
 | WhatsApp down | `/admin/messages` shows `FAILED` rows and errors. | Messages never block bookings. Fix credentials/templates, then use Retry. The 15-minute cron re-dispatches stuck `QUEUED` rows. OTPs over WhatsApp won't arrive: switch `OTP_PROVIDER=sms` if MSG91 is configured. |
 | OTP cap reached | Owner alerts at 80 %/100 %; Overview shows usage per pool. | If it's real demand: Settings → "Raise today's limits". If it's an attack: leave it; returning customers use their own pool; check the audit log for IP-limit hits. |
@@ -1331,11 +1340,11 @@ The first draft of this document found four defects; fixing them exposed a fifth
 2. **Migrations are manual on Postgres** (`npm run db:migrate`). A deploy that forgets them fails at runtime (as the local dev server did after 0006, 0007 and 0008).
 3. **The sliding-window limiter writes one row per request** to `RateLimitHit`, always in Postgres, even when Upstash is configured. Cleanup is probabilistic (about 2 % of calls delete rows older than 48 h).
 4. **The availability cache is per instance** and still reads `CacheVersion` from the DB on every poll; it saves the grid computation, not the round trip.
-5. **OTP sending via WhatsApp blocks the request during retries** (`dispatchMessage()` sleeps 1 s and 2 s between tries inline), and up to three 15 s provider timeouts before falling back to SMS.
-6. **Nothing marks bookings `COMPLETED`** automatically; reports that count completed bookings depend on staff.
-7. **Pending refunds are retried forever** (every 15 minutes, with a daily owner alert) until they succeed or the owner refunds by hand; there is no give-up state.
-8. **Only PGlite runs in the default `npm test`**, and SEC-48 shows PGlite can accept SQL that real Postgres rejects. CI runs `test:realdb`, but local runs should too before a release.
-9. `memoryRateLimit()` in `lib/ratelimit.ts` is dead code.
+5. **Nothing marks bookings `COMPLETED`** automatically; reports that count completed bookings depend on staff.
+6. **Only PGlite runs in the default `npm test`**, and SEC-48 shows PGlite can accept SQL that real Postgres rejects. CI runs `test:realdb`, but local runs should too before a release.
+7. `memoryRateLimit()` in `lib/ratelimit.ts` is dead code.
+8. **An OTP WhatsApp send that answers after the 5 s deadline** is logged `FAILED` even if WhatsApp later delivers it; the customer may receive the same code by both WhatsApp and SMS (harmless).
+9. **Refund reconciliation trusts Razorpay's refund list** right after a timeout (after a 1-minute grace period). A refund that appears in the list later than that would be retried; Razorpay's guidance is that refunds are listed immediately.
 
 ### Not done or not verified
 

@@ -7,7 +7,10 @@
 import "server-only";
 import { env, mockOtpAllowed } from "@/lib/env";
 import { getDb } from "@/db/client";
-import { enqueueMessage, dispatchMessage } from "@/lib/messaging";
+import { enqueueMessage, dispatchMessage, dispatchOnce } from "@/lib/messaging";
+
+/** One WhatsApp try for codes, then SMS: a customer shouldn't wait more than ~5 s for the fallback. [SEC-50] */
+export const OTP_WHATSAPP_TIMEOUT_MS = 5_000;
 import { AppError } from "@/lib/errors";
 import { maskForLog } from "@/lib/security";
 
@@ -38,9 +41,9 @@ export class WhatsAppOtp implements OtpProvider {
     // OTP is a user-initiated authentication message, so it is sent regardless of marketing opt-in.
     // The code itself is masked in the outbox log.
     const id = await enqueueMessage(db, { phone, template: "otp_code", params: { code }, logParams: { code: "••••••" }, optedIn: true });
-    // Report real delivery: if all 3 attempts fail, the caller must know (and can fall back to SMS)
-    // instead of telling the user "code sent". [SEC-46]
-    const status = id ? await dispatchMessage(id, { code }) : "MISSING";
+    // One attempt with a 5 s deadline, no backoff sleeps. If it fails, the caller must know (and falls
+    // back to SMS) instead of telling the user "code sent". [SEC-46][SEC-50]
+    const status = id ? await dispatchOnce(id, { code }, OTP_WHATSAPP_TIMEOUT_MS) : "MISSING";
     if (status !== "SENT" && status !== "MOCKED") throw new AppError("PROVIDER_ERROR", "We couldn't send the code on WhatsApp. Please try again in a minute.");
     return {};
   }

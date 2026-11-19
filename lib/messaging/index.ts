@@ -96,6 +96,40 @@ export async function dispatchMessage(id: string, realParams?: Record<string, st
   return "FAILED";
 }
 
+/**
+ * One delivery attempt with a deadline and no retries — for OTP codes, where the caller falls back
+ * to SMS instead of waiting (three 15 s timeouts plus backoff could take ~48 s). If the deadline
+ * passes, the row is marked FAILED; a late WhatsApp delivery is harmless (same code). [SEC-50]
+ */
+export async function dispatchOnce(id: string, realParams: Record<string, string> | undefined, timeoutMs: number): Promise<MessageStatus | "MISSING"> {
+  const db = await getDb();
+  const [row] = await db.select().from(schema.messageLogs).where(eq(schema.messageLogs.id, id));
+  if (!row) return "MISSING";
+  if (row.status === "SENT" || row.status === "MOCKED") return row.status;
+  const provider = getMessagingProvider();
+  const params = realParams ?? row.payload;
+  const language = row.language === "te" ? "te" : "en";
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const res = await Promise.race([
+      provider.send({ to: row.phone, template: row.template as TemplateName, language, params, text: renderTemplate(row.template as TemplateName, params, language) }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`no answer within ${timeoutMs} ms`)), timeoutMs);
+      }),
+    ]);
+    const status = res.mocked ? "MOCKED" : "SENT";
+    await db.update(schema.messageLogs).set({ status, attempts: row.attempts + 1, providerMessageId: res.providerMessageId, provider: provider.name, error: null, updatedAt: new Date() }).where(eq(schema.messageLogs.id, id));
+    return status;
+  } catch (e) {
+    const error = `Attempt ${row.attempts + 1} (single try): ${e instanceof Error ? e.message : String(e)}`.slice(0, 500);
+    await db.update(schema.messageLogs).set({ status: "FAILED", attempts: row.attempts + 1, error, provider: provider.name, updatedAt: new Date() }).where(eq(schema.messageLogs.id, id));
+    console.warn(`[messaging] ${row.template} → ${maskForLog(row.phone)} failed (${error})`);
+    return "FAILED";
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /** Dispatch several queued messages without blocking the caller. Errors are swallowed and logged. */
 export function dispatchInBackground(ids: (string | null | undefined)[]) {
   const list = ids.filter((x): x is string => !!x);

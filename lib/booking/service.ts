@@ -11,7 +11,7 @@
  *   and confirmation is idempotent via a row lock on the Payment.
  */
 import "server-only";
-import { and, eq, gt, inArray, isNull, lte, lt, or, sql, desc, count } from "drizzle-orm";
+import { and, eq, gt, inArray, isNotNull, isNull, lte, lt, or, sql, desc, count } from "drizzle-orm";
 import { getDb, pgErrorCode, PG_EXCLUSION_VIOLATION, PG_UNIQUE_VIOLATION, schema, transactionWithRetry, type Queryable, type Tx } from "@/db/client";
 import { siteConfig } from "@/config/site";
 import { AppError, SLOT_TAKEN_MESSAGE } from "@/lib/errors";
@@ -19,13 +19,13 @@ import { priceBreakdown, formatINR } from "@/lib/pricing";
 import { pickConsecutive, type Slot } from "@/lib/booking/slots";
 import { canCancelOnline, cancelledRefundText, hoursText, policySummary, refundFor } from "@/lib/policy";
 import { getBookingByCode, getBookingById, getSettings, loadAvailability, netPaid } from "@/lib/booking/data";
-import { getPaymentProvider, type CreatedOrder } from "@/lib/providers/payment";
+import { getPaymentProvider, ProviderOutcomeUnknown, type CreatedOrder, type ProviderRefund } from "@/lib/providers/payment";
 import { enqueueMessage, dispatchInBackground, dispatchMessage } from "@/lib/messaging";
 import { runInBackground } from "@/lib/background";
 import { invalidateAvailability } from "@/lib/booking/availability-cache";
 import { audit } from "@/lib/audit";
 import { alertOwner } from "@/lib/alerts";
-import { randomCode } from "@/lib/security";
+import { randomCode, randomToken } from "@/lib/security";
 import { formatDate, formatTimeRange, formatTime, istDateKey } from "@/lib/time";
 import { env } from "@/lib/env";
 import type { Booking, BookingSource, Payment, SettingsRow } from "@/db/schema";
@@ -476,43 +476,78 @@ export async function handlePaymentWebhook(rawBody: string, signature: string | 
 // ───────────────────────────── Refunds & cancellation ─────────────────────────────
 
 const refundStatus = (refunded: unknown) => sql`case when ${refunded} >= ${schema.payments.amount} then 'REFUNDED' else 'PAID' end`;
+const isOnline = (p: Pick<Payment, "provider">) => p.provider === "razorpay" || p.provider === "mock";
+const errText = (e: unknown) => (e instanceof Error ? e.message : String(e)).slice(0, 300);
+
+/** Give up automatic retries after this many failed attempts or this long, and ask the owner. [SEC-49] */
+export const REFUND_GIVE_UP_ATTEMPTS = 20;
+export const REFUND_GIVE_UP_MS = 24 * 3_600_000;
+/** In-flight refunds younger than this are left alone: the provider call may still be running. */
+export const REFUND_RECONCILE_AFTER_MS = 60_000;
 
 /**
- * Refunds `amount` of one payment. The amount is reserved on the Payment row first (an atomic
- * `refundAmount + amount <= amount` update), so two refunds running at once — e.g. the cron retry
- * and an owner's manual refund — can never give back more than was paid. If the provider call
- * fails, the reservation is released and the error is thrown. [SEC-45]
+ * Refunds `amount` of one payment.
+ * 1. Reserve: one atomic update adds the amount to `refundAmount` (only if it stays ≤ the payment
+ *    amount) and, for gateway payments, stores a fresh refund key + amount + time — only if no other
+ *    refund of this payment is in flight. So nothing can refund more than was paid (SEC-45), and two
+ *    refunds of one payment never overlap.
+ * 2. Call the provider with the key (Razorpay `receipt` and `notes.refund_key`).
+ * 3. Success → clear the in-flight fields. Definite failure (4xx) → release the reservation.
+ *    Unknown outcome (timeout, network, 5xx) → KEEP the reservation and key; the cron looks the
+ *    refund up by key and either records it or releases it. A timeout is never retried blindly. [SEC-49]
  */
 async function refundSinglePayment(p: Payment, amount: number, actor: string, now: Date) {
   if (amount <= 0) return 0;
   const db = await getDb();
+  const provider = isOnline(p) ? getPaymentProvider() : null;
+  const viaProvider = !!provider && p.provider === provider.name && !!p.providerPaymentId;
+  const key = viaProvider ? `rf_${randomToken(12)}` : null;
   const [claimed] = await db
     .update(schema.payments)
-    .set({ refundAmount: sql`${schema.payments.refundAmount} + ${amount}`, status: refundStatus(sql`${schema.payments.refundAmount} + ${amount}`) as never, updatedAt: now })
-    .where(and(eq(schema.payments.id, p.id), sql`${schema.payments.refundAmount} + ${amount} <= ${schema.payments.amount}`))
+    .set({
+      refundAmount: sql`${schema.payments.refundAmount} + ${amount}`,
+      status: refundStatus(sql`${schema.payments.refundAmount} + ${amount}`) as never,
+      ...(key ? { refundInFlightKey: key, refundInFlightAmount: amount, refundInFlightAt: now } : {}),
+      updatedAt: now,
+    })
+    .where(and(eq(schema.payments.id, p.id), sql`${schema.payments.refundAmount} + ${amount} <= ${schema.payments.amount}`, isNull(schema.payments.refundInFlightKey)))
     .returning({ refundAmount: schema.payments.refundAmount });
-  if (!claimed) throw new AppError("NOT_ALLOWED", "This payment has already been refunded.");
-  let refundId: string;
-  try {
-    if (p.provider === "razorpay" || p.provider === "mock") {
-      const provider = getPaymentProvider();
-      if (p.provider === provider.name && p.providerPaymentId) {
-        refundId = (await provider.refund({ paymentId: p.providerPaymentId, amountRupees: amount, notes: { paymentId: p.id } })).refundId;
-      } else {
-        refundId = `manual_${p.provider}_${Date.now()}`; // demo data paid via a different provider
-      }
-    } else {
-      refundId = `manual_${p.provider.toLowerCase()}`; // cash/UPI handed back at the counter
-    }
-  } catch (e) {
-    await db
-      .update(schema.payments)
-      .set({ refundAmount: sql`${schema.payments.refundAmount} - ${amount}`, status: refundStatus(sql`${schema.payments.refundAmount} - ${amount}`) as never, updatedAt: new Date() })
-      .where(eq(schema.payments.id, p.id));
-    throw e;
+  if (!claimed) {
+    const [cur] = await db.select({ key: schema.payments.refundInFlightKey }).from(schema.payments).where(eq(schema.payments.id, p.id));
+    if (cur?.key) throw new ProviderOutcomeUnknown("A refund for this payment is still being confirmed with the payment provider.");
+    throw new AppError("NOT_ALLOWED", "This payment has already been refunded.");
   }
-  await db.update(schema.payments).set({ providerRefundId: refundId, refundedAt: now }).where(eq(schema.payments.id, p.id));
-  await audit(db, { actor, action: "payment.refund", entity: "Payment", entityId: p.id, before: { refundAmount: claimed.refundAmount - amount }, after: { refundAmount: claimed.refundAmount, refundId } });
+  let refundId: string;
+  if (viaProvider && provider && key) {
+    try {
+      refundId = (await provider.refund({ paymentId: p.providerPaymentId!, amountRupees: amount, notes: { paymentId: p.id }, refundKey: key })).refundId;
+    } catch (e) {
+      if (e instanceof ProviderOutcomeUnknown) {
+        await audit(db, { actor, action: "payment.refund_unknown", entity: "Payment", entityId: p.id, after: { amount, refundKey: key, error: errText(e) } });
+        throw e;
+      }
+      await db
+        .update(schema.payments)
+        .set({
+          refundAmount: sql`${schema.payments.refundAmount} - ${amount}`,
+          status: refundStatus(sql`${schema.payments.refundAmount} - ${amount}`) as never,
+          refundInFlightKey: null,
+          refundInFlightAmount: 0,
+          refundInFlightAt: null,
+          updatedAt: new Date(),
+        })
+        .where(and(eq(schema.payments.id, p.id), eq(schema.payments.refundInFlightKey, key)));
+      throw e;
+    }
+  } else {
+    // Cash/UPI handed back at the counter, or demo data paid through a different provider.
+    refundId = isOnline(p) ? `manual_${p.provider}_${Date.now()}` : `manual_${p.provider.toLowerCase()}`;
+  }
+  await db
+    .update(schema.payments)
+    .set({ providerRefundId: refundId, refundedAt: now, refundInFlightKey: null, refundInFlightAmount: 0, refundInFlightAt: null })
+    .where(eq(schema.payments.id, p.id));
+  await audit(db, { actor, action: "payment.refund", entity: "Payment", entityId: p.id, before: { refundAmount: claimed.refundAmount - amount }, after: { refundAmount: claimed.refundAmount, refundId, refundKey: key } });
   return amount;
 }
 
@@ -524,7 +559,7 @@ async function refundSinglePayment(p: Payment, amount: number, actor: string, no
 async function tryRefundBooking(bookingId: string, amount: number, actor: string, now: Date): Promise<{ done: number; error?: string }> {
   const db = await getDb();
   const payments = await db.select().from(schema.payments).where(and(eq(schema.payments.bookingId, bookingId), inArray(schema.payments.status, ["PAID"])));
-  payments.sort((a, b) => Number(b.provider === "razorpay" || b.provider === "mock") - Number(a.provider === "razorpay" || a.provider === "mock"));
+  payments.sort((a, b) => Number(isOnline(b)) - Number(isOnline(a)));
   let left = amount;
   let done = 0;
   for (const p of payments) {
@@ -536,7 +571,7 @@ async function tryRefundBooking(bookingId: string, amount: number, actor: string
       left -= take;
     } catch (e) {
       if (e instanceof AppError && e.code === "NOT_ALLOWED") continue; // refunded meanwhile by someone else
-      return { done, error: e instanceof Error ? e.message : String(e) };
+      return { done, error: errText(e) };
     }
   }
   return { done };
@@ -550,16 +585,22 @@ export async function refundBookingPayments(bookingId: string, amount: number, a
 }
 
 /**
- * A refund call failed: remember the money still owed on the booking so the cron retries it, audit
- * it, and tell the owner (one WhatsApp per booking per day). [SEC-45]
+ * A refund call failed or its outcome is unknown: remember the money still owed on the booking so
+ * the cron reconciles/retries it, count the attempt, audit it, and tell the owner (one WhatsApp per
+ * booking per day). [SEC-45][SEC-49]
  */
 async function recordPendingRefund(bookingId: string, amount: number, actor: string, err: unknown, now: Date) {
   if (amount <= 0) return;
   const db = await getDb();
-  const error = (err instanceof Error ? err.message : String(err)).slice(0, 300);
+  const error = errText(err);
   const [b] = await db
     .update(schema.bookings)
-    .set({ refundPendingAmount: sql`${schema.bookings.refundPendingAmount} + ${amount}`, updatedAt: now })
+    .set({
+      refundPendingAmount: sql`${schema.bookings.refundPendingAmount} + ${amount}`,
+      refundPendingSince: sql`coalesce(${schema.bookings.refundPendingSince}, ${now.toISOString()}::timestamptz)`,
+      refundAttempts: sql`${schema.bookings.refundAttempts} + 1`,
+      updatedAt: now,
+    })
     .where(eq(schema.bookings.id, bookingId))
     .returning({ code: schema.bookings.bookingCode });
   await audit(db, { actor, action: "booking.refund_failed", entity: "Booking", entityId: bookingId, after: { amount, error } });
@@ -567,49 +608,193 @@ async function recordPendingRefund(bookingId: string, amount: number, actor: str
   void alertOwner(`refund_failed_${bookingId}`, `Refund of ${formatINR(amount)} for booking ${b?.code ?? ""} failed. It is retried automatically every 15 minutes; check the payment dashboard if this repeats.`, now);
 }
 
+/** Booking-side bookkeeping once `amount` has really gone back to the customer. */
+async function applyRefundToBooking(bookingId: string, amount: number, now: Date, opts: { fromPending: boolean }) {
+  const db = await getDb();
+  const [b] = await db
+    .update(schema.bookings)
+    .set({
+      refundAmount: sql`${schema.bookings.refundAmount} + ${amount}`,
+      ...(opts.fromPending ? { refundPendingAmount: sql`greatest(0, ${schema.bookings.refundPendingAmount} - ${amount})` } : {}),
+      status: sql`case when ${schema.bookings.status} in ('CANCELLED', 'EXPIRED') then 'REFUNDED' else ${schema.bookings.status} end` as never,
+      updatedAt: now,
+    })
+    .where(eq(schema.bookings.id, bookingId))
+    .returning({ status: schema.bookings.status, pending: schema.bookings.refundPendingAmount });
+  if (b && b.pending === 0) {
+    await db.update(schema.bookings).set({ refundPendingSince: null, refundAttempts: 0 }).where(and(eq(schema.bookings.id, bookingId), eq(schema.bookings.refundPendingAmount, 0)));
+  }
+  if (b?.status === "REFUNDED") notifyCancelled(bookingId, amount, `refund:${bookingId}:${now.getTime()}`);
+  return b;
+}
+
 /**
- * Cron: retry pending refunds. Each booking's pending amount is claimed with a compare-and-set
+ * Cron step 1: settle refunds whose outcome was unknown. For each in-flight refund older than a
+ * minute, list the payment's refunds at the provider and look for our key:
+ * - found → the money went back: record it (the reservation stays, the booking is updated);
+ * - not found → release the reservation; the booking's pending amount is then retried normally.
+ * If the lookup itself fails, try again next run. [SEC-49]
+ */
+export async function reconcileInFlightRefunds(now = new Date()) {
+  const db = await getDb();
+  const rows = await db
+    .select()
+    .from(schema.payments)
+    .where(and(isNotNull(schema.payments.refundInFlightKey), lte(schema.payments.refundInFlightAt, new Date(now.getTime() - REFUND_RECONCILE_AFTER_MS))))
+    .limit(20);
+  let settled = 0;
+  for (const p of rows) {
+    const provider = getPaymentProvider();
+    if (p.provider !== provider.name || !p.providerPaymentId || !p.refundInFlightKey) continue;
+    let found: ProviderRefund | undefined;
+    try {
+      found = (await provider.listRefunds(p.providerPaymentId)).find((r) => r.notes.refund_key === p.refundInFlightKey || r.receipt === p.refundInFlightKey);
+    } catch (e) {
+      console.warn(`[refund] lookup for payment ${p.id} failed, will retry: ${errText(e)}`);
+      continue;
+    }
+    const amount = p.refundInFlightAmount;
+    if (found) {
+      const [done] = await db
+        .update(schema.payments)
+        .set({ providerRefundId: found.id, refundedAt: now, refundInFlightKey: null, refundInFlightAmount: 0, refundInFlightAt: null, updatedAt: now })
+        .where(and(eq(schema.payments.id, p.id), eq(schema.payments.refundInFlightKey, p.refundInFlightKey)))
+        .returning({ id: schema.payments.id });
+      if (!done) continue;
+      await audit(db, { actor: "system:refund-reconcile", action: "payment.refund_reconciled", entity: "Payment", entityId: p.id, after: { amount, refundId: found.id, refundKey: p.refundInFlightKey } });
+      await applyRefundToBooking(p.bookingId, amount, now, { fromPending: true });
+      settled += amount;
+    } else {
+      await db
+        .update(schema.payments)
+        .set({
+          refundAmount: sql`${schema.payments.refundAmount} - ${amount}`,
+          status: refundStatus(sql`${schema.payments.refundAmount} - ${amount}`) as never,
+          refundInFlightKey: null,
+          refundInFlightAmount: 0,
+          refundInFlightAt: null,
+          updatedAt: now,
+        })
+        .where(and(eq(schema.payments.id, p.id), eq(schema.payments.refundInFlightKey, p.refundInFlightKey)));
+      await audit(db, { actor: "system:refund-reconcile", action: "payment.refund_not_found", entity: "Payment", entityId: p.id, after: { amount, refundKey: p.refundInFlightKey } });
+    }
+  }
+  return settled;
+}
+
+/**
+ * Cron step 2: retry pending refunds. Each booking's pending amount is claimed with a compare-and-set
  * (set to 0 only if unchanged), so overlapping cron runs can't both refund it. Whatever still fails
- * is put back. On success the booking becomes REFUNDED (if cancelled/expired) and the customer is told.
+ * is put back and counted. After REFUND_GIVE_UP_ATTEMPTS failed attempts or REFUND_GIVE_UP_MS since
+ * the first failure, the booking is marked "needs manual refund", retries stop, and the owner gets
+ * one alert. [SEC-45][SEC-49]
  */
 export async function retryPendingRefunds(now = new Date()) {
   const db = await getDb();
   const due = await db
-    .select({ id: schema.bookings.id, pending: schema.bookings.refundPendingAmount })
+    .select({ id: schema.bookings.id, pending: schema.bookings.refundPendingAmount, since: schema.bookings.refundPendingSince, attempts: schema.bookings.refundAttempts })
     .from(schema.bookings)
-    .where(gt(schema.bookings.refundPendingAmount, 0))
+    .where(and(gt(schema.bookings.refundPendingAmount, 0), eq(schema.bookings.refundNeedsManual, false)))
     .limit(20);
   let refunded = 0;
   for (const row of due) {
+    if (row.attempts >= REFUND_GIVE_UP_ATTEMPTS || (row.since && now.getTime() - row.since.getTime() >= REFUND_GIVE_UP_MS)) {
+      const [gaveUp] = await db
+        .update(schema.bookings)
+        .set({ refundNeedsManual: true, updatedAt: now })
+        .where(and(eq(schema.bookings.id, row.id), eq(schema.bookings.refundNeedsManual, false)))
+        .returning({ code: schema.bookings.bookingCode });
+      if (gaveUp) {
+        await audit(db, { actor: "system:refund-retry", action: "booking.refund_needs_manual", entity: "Booking", entityId: row.id, after: { pending: row.pending, attempts: row.attempts } });
+        void alertOwner(
+          `refund_manual_${row.id}`,
+          `Refund of ${formatINR(row.pending)} for booking ${gaveUp.code} could not be completed automatically (${row.attempts} attempts). Refund it from the Razorpay dashboard, then press "Mark refunded" under Refunds needing attention on the Overview page.`,
+          now,
+        );
+      }
+      continue;
+    }
     const [claimed] = await db
       .update(schema.bookings)
       .set({ refundPendingAmount: 0, updatedAt: now })
-      .where(and(eq(schema.bookings.id, row.id), eq(schema.bookings.refundPendingAmount, row.pending)))
-      .returning({ status: schema.bookings.status, code: schema.bookings.bookingCode });
+      .where(and(eq(schema.bookings.id, row.id), eq(schema.bookings.refundPendingAmount, row.pending), eq(schema.bookings.refundNeedsManual, false)))
+      .returning({ code: schema.bookings.bookingCode });
     if (!claimed) continue;
     const r = await tryRefundBooking(row.id, row.pending, "system:refund-retry", now);
     if (r.done > 0) {
       refunded += r.done;
-      await db
-        .update(schema.bookings)
-        .set({
-          refundAmount: sql`${schema.bookings.refundAmount} + ${r.done}`,
-          status: sql`case when ${schema.bookings.status} in ('CANCELLED', 'EXPIRED') then 'REFUNDED' else ${schema.bookings.status} end` as never,
-          updatedAt: now,
-        })
-        .where(eq(schema.bookings.id, row.id));
       await audit(db, { actor: "system:refund-retry", action: "booking.refund_retried", entity: "Booking", entityId: row.id, after: { refunded: r.done } });
-      if (claimed.status === "CANCELLED" || claimed.status === "EXPIRED") notifyCancelled(row.id, r.done, `refund:${row.id}:${now.getTime()}`);
+      await applyRefundToBooking(row.id, r.done, now, { fromPending: false });
     }
     // Put back what is still owed. If nothing refundable is left (refunded by hand meanwhile), drop it.
     const left = r.error ? row.pending - r.done : 0;
     if (left > 0) {
-      await db.update(schema.bookings).set({ refundPendingAmount: sql`${schema.bookings.refundPendingAmount} + ${left}` }).where(eq(schema.bookings.id, row.id));
+      await db
+        .update(schema.bookings)
+        .set({ refundPendingAmount: sql`${schema.bookings.refundPendingAmount} + ${left}`, refundAttempts: sql`${schema.bookings.refundAttempts} + 1` })
+        .where(eq(schema.bookings.id, row.id));
       console.warn(`[refund] retry for ${claimed.code} failed: ${r.error}`);
       void alertOwner(`refund_failed_${row.id}`, `Refund of ${formatINR(left)} for booking ${claimed.code} is still failing. Check the payment dashboard.`, now);
+    } else {
+      await db.update(schema.bookings).set({ refundPendingSince: null, refundAttempts: 0 }).where(and(eq(schema.bookings.id, row.id), eq(schema.bookings.refundPendingAmount, 0)));
     }
   }
   return refunded;
+}
+
+/** Bookings whose refund gave up retrying — shown on the Overview "Refunds needing attention" card. */
+export async function refundsNeedingAttention() {
+  const db = await getDb();
+  return db
+    .select({
+      id: schema.bookings.id,
+      bookingCode: schema.bookings.bookingCode,
+      pending: schema.bookings.refundPendingAmount,
+      since: schema.bookings.refundPendingSince,
+      attempts: schema.bookings.refundAttempts,
+      name: schema.customers.name,
+    })
+    .from(schema.bookings)
+    .innerJoin(schema.customers, eq(schema.bookings.customerId, schema.customers.id))
+    .where(and(eq(schema.bookings.refundNeedsManual, true), gt(schema.bookings.refundPendingAmount, 0)))
+    .orderBy(schema.bookings.refundPendingSince);
+}
+
+/**
+ * Owner: "I refunded this from the Razorpay dashboard." Records the pending amount as refunded
+ * (payments marked `manual_owner`), clears the give-up state, audits it and tells the customer.
+ * Refused while a refund is still in flight (its outcome isn't known yet). [SEC-49]
+ */
+export async function markRefundedManually(bookingId: string, actor: string, now = new Date()) {
+  const db = await getDb();
+  const d = await getBookingById(bookingId, db);
+  if (!d) throw new AppError("NOT_FOUND", "Booking not found.");
+  const amount = d.booking.refundPendingAmount;
+  if (amount <= 0) throw new AppError("NOT_ALLOWED", "There is no pending refund on this booking.");
+  if (d.payments.some((p) => p.refundInFlightKey)) throw new AppError("NOT_ALLOWED", "A refund is still being checked with the payment provider. Try again after the next automatic run (15 minutes).");
+  const [claimed] = await db
+    .update(schema.bookings)
+    .set({ refundPendingAmount: 0, refundNeedsManual: false, refundPendingSince: null, refundAttempts: 0, updatedAt: now })
+    .where(and(eq(schema.bookings.id, bookingId), eq(schema.bookings.refundPendingAmount, amount)))
+    .returning({ id: schema.bookings.id });
+  if (!claimed) throw new AppError("NOT_ALLOWED", "This refund changed meanwhile. Refresh and try again.");
+  let left = amount;
+  const paid = d.payments.filter((p) => p.status === "PAID").sort((a, b) => Number(isOnline(b)) - Number(isOnline(a)));
+  for (const p of paid) {
+    if (left <= 0) break;
+    const take = Math.min(left, p.amount - p.refundAmount);
+    if (take <= 0) continue;
+    const [ok] = await db
+      .update(schema.payments)
+      .set({ refundAmount: sql`${schema.payments.refundAmount} + ${take}`, status: refundStatus(sql`${schema.payments.refundAmount} + ${take}`) as never, providerRefundId: "manual_owner", refundedAt: now, updatedAt: now })
+      .where(and(eq(schema.payments.id, p.id), sql`${schema.payments.refundAmount} + ${take} <= ${schema.payments.amount}`, isNull(schema.payments.refundInFlightKey)))
+      .returning({ id: schema.payments.id });
+    if (ok) left -= take;
+  }
+  const recorded = amount - left;
+  await audit(db, { actor, action: "booking.refund_marked_manual", entity: "Booking", entityId: bookingId, after: { amount: recorded } });
+  await applyRefundToBooking(bookingId, recorded, now, { fromPending: false });
+  return recorded;
 }
 
 export type CancelRefund = { mode: "POLICY" } | { mode: "FULL" } | { mode: "NONE" } | { mode: "PARTIAL"; amount: number };
