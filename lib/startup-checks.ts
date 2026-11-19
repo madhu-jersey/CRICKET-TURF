@@ -32,7 +32,29 @@ export function configWarnings(e: CheckEnv): string[] {
   if (!live) return [];
   const w: string[] = [];
   if ((e.ADMIN_2FA_REQUIRED ?? "").trim() === "false") w.push("ADMIN_2FA_REQUIRED=false — dashboard logins do not need a phone code");
+  if (!(e.SENTRY_DSN ?? "").trim()) w.push("SENTRY_DSN is not set — server errors are only in the platform logs (no error tracking)");
   return w;
+}
+
+/**
+ * DB check: every migration the code expects has been applied. Runs before anything else touches
+ * the database, so a forgotten `npm run deploy:migrate` stops the deploy with the missing names
+ * instead of failing later with "column does not exist". [SEC-52]
+ */
+export async function migrationProblems(): Promise<string[]> {
+  const { getDb } = await import("@/db/client");
+  const { sql } = await import("drizzle-orm");
+  const { missingMigrations } = await import("@/db/migration-list");
+  const db = await getDb();
+  let applied: string[];
+  try {
+    const rows = (await db.execute(sql`select "name" from "_migrations"`)) as unknown as { name: string }[] | { rows: { name: string }[] };
+    applied = (Array.isArray(rows) ? rows : rows.rows).map((r) => String(r.name));
+  } catch {
+    applied = [];
+  }
+  const missing = missingMigrations(applied);
+  return missing.length ? [`The database is missing migrations: ${missing.join(", ")}. Run "npm run deploy:migrate" against this database, then deploy again.`] : [];
 }
 
 /** DB check: no admin account still accepts the published demo password. */
@@ -53,6 +75,7 @@ export async function runStartupChecks(e: CheckEnv = process.env) {
   const live = e.NODE_ENV === "production" && (e.DEMO_MODE ?? "true").trim() === "false";
   if (!live) return;
   const problems = configProblems(e);
+  if (!problems.length) problems.push(...(await migrationProblems()));
   if (!problems.length) problems.push(...(await demoAdminProblems()));
   for (const w of configWarnings(e)) console.warn(`[startup] WARNING: ${w}`);
   if (problems.length) {

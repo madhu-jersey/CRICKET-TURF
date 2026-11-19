@@ -949,6 +949,7 @@ All handlers are in `app/api/**/route.ts`, wrapped by `lib/errors.ts › handle(
 | GET `/api/files/[id]` | none | 300/min per IP (fixed window) | UUID of a gallery file | gallery image bytes (WebP), cached for a year | `app/api/files/[id]/route.ts` |
 | GET `/api/my-bookings` | `bba_vp` | — | — | up to 100 bookings, newest first | `app/api/my-bookings/route.ts` |
 | GET/POST `/api/my-bookings/whatsapp` | `bba_vp` | — | POST `{optIn}` | opt-in state; audit | `app/api/my-bookings/whatsapp/route.ts` |
+| GET `/api/health` | none | — | — | `ok` 200 if `select 1` answers within 2 s, else `unavailable` 503 | `app/api/health/route.ts` |
 | GET `/api/cron/expire-holds` | Bearer `CRON_SECRET` | — | — | `{expired}` | `app/api/cron/expire-holds/route.ts` |
 | GET `/api/cron/send-reminders` | Bearer `CRON_SECRET` | — | — | `{reminders, expired, redispatched, refundsReconciled, refundsRetried}` | `app/api/cron/send-reminders/route.ts` |
 
@@ -1032,6 +1033,10 @@ Every admin write is audit-logged (`lib/audit.ts`).
 | Typed date comparison in block check | Block creation crashing on real Postgres | `createBlocks()` | — | SEC-48 |
 | Refund keys, reconcile, give-up | Double refunds after timeouts; endless retries | `refundSinglePayment()`, `reconcileInFlightRefunds()`, `retryPendingRefunds()`, `markRefundedManually()` | — | SEC-49 |
 | One-try WhatsApp OTP | ~48 s wait before SMS fallback | `dispatchOnce()`, `OTP_WHATSAPP_TIMEOUT_MS` | — | SEC-50 |
+| Migration guard + locked deploy migrate | Running against a stale schema; overlapping migrations | `lib/startup-checks.ts › migrationProblems()`, `db/migration-list.ts`, `db/cli.ts` (`deploy`) | — | SEC-52 |
+| Owner CLI tools | Seeding demo data on live; lockout with no recovery path | `scripts/admin.ts`, `lib/admin/tools.ts` | `DATABASE_URL` | SEC-53 |
+| Money alerts | Silent amount mismatches; a wrong webhook secret going unnoticed | `confirmPayment()`, `noteBadWebhookSignature()` | — | SEC-54 |
+| Scrubbed error reporting + health check | Errors and outages going unnoticed | `lib/error-report.ts`, `app/api/health/route.ts` | `SENTRY_DSN` | SEC-55 |
 | Gallery-only file serving + limit | Serving orphan files; DB hammering | `app/api/files/[id]/route.ts` | — | SEC-51 |
 
 ### Rate limits
@@ -1100,10 +1105,11 @@ API responses (JSON) and prefetch requests don't get the CSP. `style-src 'unsafe
 5. `OTP_PROVIDER` missing or `mock`.
 6. `NEXT_PUBLIC_SITE_URL` doesn't start with `https://`.
 7. `NEXT_PUBLIC_TURNSTILE_SITE_KEY` or `TURNSTILE_SECRET_KEY` missing.
-8. (Only if 1–7 pass, checked in the DB) no active OWNER has a phone number.
-9. (Same) `owner@demo.com` or `staff@demo.com` is active and still accepts `Demo@1234`.
+8. (Only if 1–7 pass, checked in the DB) a migration listed in `db/migration-list.ts` is missing from the `_migrations` table — the message names each missing file and says to run `npm run deploy:migrate` (SEC-52).
+9. (Only if 1–8 pass) no active OWNER has a phone number.
+10. (Same) `owner@demo.com` or `staff@demo.com` is active and still accepts `Demo@1234`.
 
-Warning only: `ADMIN_2FA_REQUIRED=false`.
+Warnings only: `ADMIN_2FA_REQUIRED=false`; `SENTRY_DSN` not set.
 
 ---
 
@@ -1137,6 +1143,8 @@ Warning only: `ADMIN_2FA_REQUIRED=false`.
 | `STORAGE_PROVIDER` | `db` or `supabase` | `db` | `supabase` recommended | enum | `lib/storage.ts` |
 | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_BUCKET` | Supabase Storage (bucket default `gallery`) | — | if `supabase` | strings | `lib/storage.ts` |
 | `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` | Fixed-window counters in Redis | — | optional | URL, token | `lib/counter.ts` |
+| `SENTRY_DSN` | Optional error tracking (scrubbed) | — | recommended (warning if unset) | DSN URL | `lib/error-report.ts` |
+| `PRODUCTION_DATABASE_URL` | GitHub secret for the manual migrate job | — | CI only | URL | `.github/workflows/migrate-production.yml` |
 | `NEXT_DIST_DIR` | Build folder (e2e uses `.next-e2e`) | — | — | path | `next.config.ts` |
 | `TEST_DATABASE_URL`, `TEST_DB_ALLOWED_HOSTS` | Real Postgres for tests only | tests | never | URL, comma list | `tests/support/test-db.ts`, `scripts/test-concurrency.mjs` |
 
@@ -1202,7 +1210,7 @@ Outside production (`next dev`, tests), mocks are always allowed.
 | Expire holds | `* * * * *` | GET `/api/cron/expire-holds` | `Authorization: Bearer <CRON_SECRET>` (constant time); open only outside production when unset | One `UPDATE` of overdue holds to `EXPIRED`, cache bumps | Harmless: availability ignores expired holds anyway; a second run updates nothing |
 | Reminders + safety net | `*/15 * * * *` | GET `/api/cron/send-reminders` | same | Expire holds; 2-hour reminders; re-dispatch up to 50 stuck messages; retry up to 20 pending refunds | Reminders are claimed by `reminderSentAt`, so no duplicates; a late run still reminds bookings starting within 2 h; a missed run can mean a reminder later than 2 h before |
 
-Run time: each is a few queries plus message sends; `redispatchStuck()` may wait on provider retries (up to about 3 s per message with default backoff). Per-minute crons need a Vercel Pro plan; on Hobby, change to daily or use an external pinger (README).
+Both are safe on any scheduler and at any frequency down to hourly (SEC-56): hold expiry is lazy anyway, and reminders go to any confirmed booking starting within 2 h that hasn't had one. On Vercel Hobby the per-minute schedule is rejected; the README gives Supabase `pg_cron` + `pg_net` and cron-job.org setups. Run time: each is a few queries plus message sends; `redispatchStuck()` may wait on provider retries (up to about 3 s per message with default backoff). Per-minute crons need a Vercel Pro plan; on Hobby, change to daily or use an external pinger (README).
 
 Background work inside requests (`runInBackground()`) uses `after()`, so on Vercel it runs after the response within the same invocation.
 
@@ -1288,10 +1296,10 @@ All jobs except `zap` run in parallel.
 
 ### Deploy to Vercel + Supabase
 
-1. **Database.** Create a Supabase project. Run `npm run db:migrate` locally with `DATABASE_URL` pointing at it. The app does **not** run migrations itself when `DATABASE_URL` is set. Do not run `db:seed` on a live database (it creates demo admins and demo bookings). Enable Row Level Security on every table with no policies (SEC-32), since the app connects as the database role.
-2. **Admins.** Create the real OWNER account (the seed is the only built-in way; otherwise insert it directly or seed then change the password and delete `staff@demo.com`). Give the OWNER a phone number. The server refuses to start while a demo admin accepts `Demo@1234`.
+1. **Database.** Create a Supabase project. Run `npm run deploy:migrate` with `DATABASE_URL` pointing at it (session advisory lock, never seeds), or the manual **migrate-production** GitHub Action (`PRODUCTION_DATABASE_URL` secret). Order is always **migrate → deploy**: the app doesn't run migrations itself, and a live server refuses to start while any is missing. Do not run `db:seed` on a live database (it creates demo admins and demo bookings). Enable Row Level Security on every table with no policies (SEC-32), since the app connects as the database role.
+2. **Admins.** `npm run admin:create -- --email … --name … --phone +91…` creates the OWNER (hidden password prompt, password rules, refuses if an active OWNER exists unless `--force`); `npm run admin:remove-demo` deactivates the demo accounts if present (`scripts/admin.ts`, `lib/admin/tools.ts`, SEC-53). The server refuses to start while a demo admin accepts `Demo@1234` or the OWNER has no phone.
 3. **Environment.** In Vercel set: `NODE_ENV` (Vercel sets production), `DEMO_MODE=false`, `APP_SECRET`, `CRON_SECRET`, `DATABASE_URL` (use the pooled connection; `prepare: false` is already set), `NEXT_PUBLIC_SITE_URL=https://<domain>`, Razorpay keys, `OTP_PROVIDER`, messaging keys, Turnstile keys and `TURNSTILE_HOSTNAMES`, and optionally `STORAGE_PROVIDER=supabase` + Supabase keys, Upstash keys.
-4. **Crons.** `vercel.json` registers both crons. Vercel sends `Authorization: Bearer $CRON_SECRET` automatically. Per-minute needs Pro.
+4. **Crons.** Vercel Pro: `vercel.json` registers both and sends `Authorization: Bearer $CRON_SECRET`. Hobby (non-commercial, daily schedules only): remove the `crons` block and use Supabase `pg_cron` + `pg_net` or cron-job.org with the same header (README). Hourly is enough.
 5. **Razorpay.** Complete KYC. Add the webhook `https://<domain>/api/webhooks/razorpay` with `payment.captured`, `payment.failed`, `order.paid`; put its secret in `RAZORPAY_WEBHOOK_SECRET`.
 6. **WhatsApp.** Meta business verification; get `otp_code` (Authentication) and the six Utility templates approved with the exact names and parameter order from `lib/messaging/templates.ts` (and Telugu versions if `MESSAGE_LANGUAGE=te`). For SMS, DLT-registered MSG91 template with an `##otp##` variable.
 7. **Turnstile.** Create a widget for the domain; set both keys.
@@ -1304,7 +1312,10 @@ All jobs except `zap` run in parallel.
 - **Audit log** (`/admin/audit`): every admin write, payment outcome, refund, refund failure, amount mismatch, IP-limit hit (masked), auto-block, logins.
 - **Message outbox** (`/admin/messages`): delivery status, errors, retry.
 - **Server logs:** `console.warn/error` with masked phones.
-- **Not present:** error tracking (Sentry etc.), uptime checks, alerting on 5xx or on `payment.amount_mismatch`, metrics.
+- **Error tracking (optional):** `SENTRY_DSN` → unexpected route-handler errors (`lib/errors.ts`) and page errors (`instrumentation.ts › onRequestError()`) go to Sentry, scrubbed of phones and e-mails, without bodies/headers/cookies (`lib/error-report.ts`).
+- **Health:** `GET /api/health` for UptimeRobot or similar (README).
+- **Money alerts:** every payment amount mismatch; more than 5 bad webhook signatures in an hour (one alert per hour).
+- **Not present:** metrics, log aggregation, automatic backups (use Supabase's).
 
 ### Runbook
 
@@ -1314,7 +1325,7 @@ All jobs except `zap` run in parallel.
 | Webhook failing | 400 = signature (wrong `RAZORPAY_WEBHOOK_SECRET` or body altered by a proxy); 404 = unknown order (wrong environment/keys); 500 = check logs. | Fix the secret; the checkout callback still confirms bookings meanwhile. |
 | WhatsApp down | `/admin/messages` shows `FAILED` rows and errors. | Messages never block bookings. Fix credentials/templates, then use Retry. The 15-minute cron re-dispatches stuck `QUEUED` rows. OTPs over WhatsApp won't arrive: switch `OTP_PROVIDER=sms` if MSG91 is configured. |
 | OTP cap reached | Owner alerts at 80 %/100 %; Overview shows usage per pool. | If it's real demand: Settings → "Raise today's limits". If it's an attack: leave it; returning customers use their own pool; check the audit log for IP-limit hits. |
-| Owner locked out | Wrong password 5 times → wait 15 min. Lost phone → use a recovery code on the login screen. Forgot password → `/admin/forgot` (needs the phone). | If both phone and recovery codes are lost: a database operator must set a new bcrypt hash and phone on the `AdminUser` row and bump `trustEpoch`. |
+| Owner locked out | Wrong password 5 times → wait 15 min. Lost phone → use a recovery code on the login screen. Forgot password → `/admin/forgot` (needs the phone). | If both phone and recovery codes are lost: someone with the database URL runs `npm run admin:recover -- --email … --phone +91…` — it prints a temporary password (must be changed at login), signs out every session and trusted device, deletes the old recovery codes and audits it. |
 | DB connection limit reached | Errors like "too many connections"; Supabase connection graph. | Use the Supabase pooler URL, lower `DATABASE_POOL_SIZE` (default 5 per instance). |
 | A double booking is reported | Query both bookings: same court, overlapping times, both `CONFIRMED`? The constraint makes this impossible for two active bookings. More likely: a `COMPLETED`/`NO_SHOW` booking (not in the constraint), a block created before SEC-47 that overlaps a booking, or two different courts. | Cancel one with a refund; check the audit log for who created each. |
 
@@ -1337,14 +1348,13 @@ The first draft of this document found four defects; fixing them exposed a fifth
 ### Remaining risks
 
 1. **Unblocking a customer doesn't reset their no-show count**, so their next no-show re-blocks them immediately.
-2. **Migrations are manual on Postgres** (`npm run db:migrate`). A deploy that forgets them fails at runtime (as the local dev server did after 0006, 0007 and 0008).
-3. **The sliding-window limiter writes one row per request** to `RateLimitHit`, always in Postgres, even when Upstash is configured. Cleanup is probabilistic (about 2 % of calls delete rows older than 48 h).
-4. **The availability cache is per instance** and still reads `CacheVersion` from the DB on every poll; it saves the grid computation, not the round trip.
-5. **Nothing marks bookings `COMPLETED`** automatically; reports that count completed bookings depend on staff.
-6. **Only PGlite runs in the default `npm test`**, and SEC-48 shows PGlite can accept SQL that real Postgres rejects. CI runs `test:realdb`, but local runs should too before a release.
-7. `memoryRateLimit()` in `lib/ratelimit.ts` is dead code.
-8. **An OTP WhatsApp send that answers after the 5 s deadline** is logged `FAILED` even if WhatsApp later delivers it; the customer may receive the same code by both WhatsApp and SMS (harmless).
-9. **Refund reconciliation trusts Razorpay's refund list** right after a timeout (after a 1-minute grace period). A refund that appears in the list later than that would be retried; Razorpay's guidance is that refunds are listed immediately.
+2. **The sliding-window limiter writes one row per request** to `RateLimitHit`, always in Postgres, even when Upstash is configured. Cleanup is probabilistic (about 2 % of calls delete rows older than 48 h).
+3. **The availability cache is per instance** and still reads `CacheVersion` from the DB on every poll; it saves the grid computation, not the round trip.
+4. **Nothing marks bookings `COMPLETED`** automatically; reports that count completed bookings depend on staff.
+5. **Only PGlite runs in the default `npm test`**, and SEC-48 shows PGlite can accept SQL that real Postgres rejects. CI runs `test:realdb`, but local runs should too before a release.
+6. `memoryRateLimit()` in `lib/ratelimit.ts` is dead code.
+7. **An OTP WhatsApp send that answers after the 5 s deadline** is logged `FAILED` even if WhatsApp later delivers it; the customer may receive the same code by both WhatsApp and SMS (harmless).
+8. **Refund reconciliation trusts Razorpay's refund list** right after a timeout (after a 1-minute grace period). A refund that appears in the list later than that would be retried; Razorpay's guidance is that refunds are listed immediately.
 
 ### Not done or not verified
 

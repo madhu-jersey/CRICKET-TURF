@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { ZodError } from "zod";
 import { firstIssue } from "@/lib/validation";
+import { reportError } from "@/lib/error-report";
 
 export type ErrorCode =
   | "VALIDATION"
@@ -51,7 +52,7 @@ export class AppError extends Error {
 
 export const SLOT_TAKEN_MESSAGE = "This slot was just taken, please pick another.";
 
-export function errorResponse(err: unknown) {
+export function errorResponse(err: unknown, ctx: { method?: string; path?: string } = {}) {
   if (err instanceof AppError) {
     return NextResponse.json({ error: { code: err.code, message: err.message } }, { status: err.status });
   }
@@ -59,6 +60,7 @@ export function errorResponse(err: unknown) {
     return NextResponse.json({ error: { code: "VALIDATION", message: firstIssue(err) } }, { status: 400 });
   }
   console.error("[api] unexpected error", err);
+  reportError(err, ctx); // optional Sentry, scrubbed (SEC-55)
   return NextResponse.json({ error: { code: "INTERNAL", message: "Something went wrong. Please try again." } }, { status: 500 });
 }
 
@@ -68,7 +70,8 @@ export function handle<A extends unknown[]>(fn: (...args: A) => Promise<Response
     try {
       return await fn(...args);
     } catch (e) {
-      return errorResponse(e);
+      const req = args[0] instanceof Request ? args[0] : undefined;
+      return errorResponse(e, req ? { method: req.method, path: new URL(req.url).pathname } : {});
     }
   };
 }

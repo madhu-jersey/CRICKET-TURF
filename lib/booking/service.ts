@@ -25,6 +25,7 @@ import { runInBackground } from "@/lib/background";
 import { invalidateAvailability } from "@/lib/booking/availability-cache";
 import { audit } from "@/lib/audit";
 import { alertOwner } from "@/lib/alerts";
+import { getCounterStore } from "@/lib/counter";
 import { randomCode, randomToken } from "@/lib/security";
 import { formatDate, formatTimeRange, formatTime, istDateKey } from "@/lib/time";
 import { env } from "@/lib/env";
@@ -389,6 +390,14 @@ export async function confirmPayment(
   });
 
   const code = result.booking.bookingCode;
+  if (result.outcome === "AMOUNT_MISMATCH") {
+    // Money arrived that doesn't match the order: always worth a look (every occurrence). [SEC-54]
+    void alertOwner(
+      `amount_mismatch_${result.payment.id}_${now.getTime()}`,
+      `Payment amount mismatch on booking ${code}: expected ${formatINR(result.payment.amount)}, Razorpay reported ${formatINR(Math.round((input.amountPaise ?? 0) / 100))}. The booking was NOT confirmed. Check the Razorpay dashboard.`,
+      now,
+    );
+  }
   if (result.outcome !== "ALREADY_PROCESSED" && result.outcome !== "CONFIRMED") await invalidateAvailability(result.booking.courtId, result.booking.startAt);
   if (result.outcome === "CONFIRMED" || result.outcome === "CONFIRMED_LATE") {
     notifyConfirmed(result.booking.id);
@@ -443,10 +452,30 @@ function minimalPayload(event: string, pay: { id?: string; order_id?: string; am
   return { event, payment: { id: pay.id, order_id: pay.order_id, amount: pay.amount, status: pay.status, method: pay.method } };
 }
 
+/**
+ * Counts webhook calls with a bad signature per clock hour; above 5 in an hour the owner gets one
+ * alert for that hour (a wrong RAZORPAY_WEBHOOK_SECRET after a key rotation, or someone probing). [SEC-54]
+ */
+export const BAD_WEBHOOK_ALERT_AFTER = 5;
+async function noteBadWebhookSignature(now = new Date()) {
+  try {
+    const hour = Math.floor(now.getTime() / 3_600_000) * 3_600_000;
+    const n = await getCounterStore().incr(`webhook-badsig:${hour}`, new Date(hour + 3_600_000));
+    if (n > BAD_WEBHOOK_ALERT_AFTER) {
+      void alertOwner(`webhook_badsig_${hour}`, `More than ${BAD_WEBHOOK_ALERT_AFTER} Razorpay webhooks with a bad signature this hour (${n} so far). Check RAZORPAY_WEBHOOK_SECRET matches the Razorpay dashboard; paid bookings may not be confirming.`, now);
+    }
+  } catch (e) {
+    console.warn("[webhook] could not count bad signature", e);
+  }
+}
+
 /** Verifies and processes a Razorpay (or mock) webhook. Idempotent per event id. */
 export async function handlePaymentWebhook(rawBody: string, signature: string | null, eventIdHeader: string | null) {
   const provider = getPaymentProvider();
-  if (!signature || !provider.verifyWebhookSignature(rawBody, signature)) throw new AppError("INVALID_SIGNATURE", "Invalid webhook signature");
+  if (!signature || !provider.verifyWebhookSignature(rawBody, signature)) {
+    await noteBadWebhookSignature();
+    throw new AppError("INVALID_SIGNATURE", "Invalid webhook signature");
+  }
   let body: {
     event?: string;
     payload?: { payment?: { entity?: { id?: string; order_id?: string; amount?: number } }; order?: { entity?: { id?: string } } };

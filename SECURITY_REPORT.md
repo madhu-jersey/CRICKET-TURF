@@ -292,6 +292,31 @@ Found while writing `docs/ARCHITECTURE.md` from the code (SEC-44 → SEC-47); SE
 - **Fix:** files are served only if a `GalleryImage` row points at them (`storageKey = 'db:<id>'`); 300 requests per minute per network (shared fixed window) → 429 with `Retry-After`.
 - **Tests:** `hardening-p1.test.ts › SEC-51` — a StoredFile with no gallery entry is 404 and is served once it belongs to the gallery; 300 requests pass, the 301st is 429, another network is unaffected.
 
+### Hardening round — P2: go-live blockers (SEC-52 → SEC-56)
+
+### SEC-52 — A deploy could run against a database missing migrations · **Medium** · Fixed
+- **Proof:** migrations were a manual step; the dev server failed with "column does not exist" after 0006, 0007 and 0008 until restarted with the new schema. Nothing stopped two migration runs overlapping.
+- **Fix:** `db/migration-list.ts` lists every expected migration (a test keeps it equal to `db/migrations/`; the .sql files may not be bundled on Vercel). A live server checks `_migrations` at startup and refuses to start, naming each missing file. `npm run deploy:migrate` applies migrations on one connection under `pg_advisory_lock` (fixed key), never seeds. New manual-only workflow `migrate-production` (typed confirmation, `production` environment, `PRODUCTION_DATABASE_URL` secret). README order: migrate → deploy.
+- **Tests:** `tests/security/hardening-p2.test.ts › SEC-52` (list equals the folder; a deleted `_migrations` row → the startup check names it and exits 1); `tests/concurrency/deploy-migrate.test.ts` (two parallel `deploy:migrate` processes on a fresh Postgres database: both exit 0, one applies, one finds nothing to do, every migration recorded once).
+
+### SEC-53 — No safe way to create or recover owner accounts on a live database · **Medium** · Fixed
+- **Proof:** the only built-in way to get an owner was `db:seed` (demo admins + demo bookings) or hand-written SQL; if the owner lost both phone and recovery codes, recovery needed direct database edits.
+- **Fix:** `npm run admin:create` (hidden password prompt, password rules, Indian mobile required, refuses if an active OWNER exists unless `--force`), `npm run admin:remove-demo` (deactivates and signs out the demo accounts), `npm run admin:recover` (temporary password + forced change, bumps `trustEpoch`, deletes sessions and recovery codes, optional new phone, audited). Logic in `lib/admin/tools.ts`, CLI in `scripts/admin.ts`.
+- **Tests:** `hardening-p2.test.ts › SEC-53`; also run by hand against a throwaway database (create, weak password refused, remove-demo, recover).
+
+### SEC-54 — Money problems weren't alerted · **Medium** · Fixed
+- **Fix:** every `payment.amount_mismatch` sends the owner a WhatsApp alert (the booking stays unconfirmed). Webhooks with a bad signature are counted per clock hour (shared counter); above 5 in an hour the owner gets one alert for that hour (e.g. a wrong `RAZORPAY_WEBHOOK_SECRET` after rotating keys).
+- **Tests:** `hardening-p2.test.ts › SEC-54` (mismatch → one alert, booking still pending, a duplicate event doesn't alert again; 9 bad signatures → exactly one alert; 5 → none).
+
+### SEC-55 — No error tracking or health check · **Low** · Fixed
+- **Fix:** optional `SENTRY_DSN`: unexpected route-handler errors and page errors (`instrumentation.ts › onRequestError`) are sent via Sentry's envelope API (no SDK) with phone numbers and e-mails masked, path without query string, and no bodies, headers or cookies; a live server warns at startup if it's unset. `GET /api/health` → `ok` 200 when `select 1` answers within 2 s, else `unavailable` 503; no auth, no data. README: UptimeRobot setup.
+- **Tests:** `hardening-p2.test.ts › SEC-55` (scrubbing; nothing sent without a DSN; envelope endpoint, auth header and scrubbed body with one; startup warning; health 200 / 503 when the DB hangs (answers in under 3 s) / 503 when it errors).
+
+### SEC-56 — Scheduled jobs assumed Vercel Pro · **Low** · Fixed (documented)
+- **Finding:** Vercel Hobby is for non-commercial use and rejects per-minute schedules. Checked: hold expiry is lazy (crons only tidy up), reminders go to any confirmed booking starting within 2 h without one (so an hourly or late run still sends them, once), refund reconcile/retry and stuck-message retry are idempotent.
+- **Fix:** README documents Vercel Pro, Supabase `pg_cron` + `pg_net` (SQL included) and cron-job.org (bearer header), and that hourly is enough.
+- **Tests:** `hardening-p2.test.ts › SEC-56` (a run 90 minutes before start sends the reminder; the next hourly run doesn't resend).
+
 ### SEC-28 — Dev dependency advisory (picomatch ReDoS via vitest) · **Low** · Fixed (resolved upstream)
 - Earlier: 5 high advisories in `picomatch` inside the test runner. Re-checked 18 Nov 2026: `npm audit` and `npm audit --omit=dev` both report **0 vulnerabilities**. CI now fails on any high advisory in production dependencies.
 
