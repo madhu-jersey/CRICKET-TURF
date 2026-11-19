@@ -347,7 +347,7 @@ Found while writing `docs/ARCHITECTURE.md` from the code (SEC-44 → SEC-47); SE
 
 ### SEC-63 — Remaining admin pages had small tap targets · **Low** · Fixed
 - **Proof:** the mobile check, extended to overview, pricing, courts, gallery, team, audit, message outbox, customers and blocked slots, found: "Open schedule" link 20 px; pricing band remove ✕ 11 × 20 px, "+ Add time band" 20 px, checkboxes/radios 13 × 13 px; small `size="sm"` buttons 36–40 px; gallery move/delete buttons 22 px, file input 36 px; holiday/blocked "Remove" 26 px; pagination and outbox filter links 30 px; outbox Retry 26 px; customer search 40 px.
-- **Fix:** all at least 44 px on phones (the `sm` button size gets `min-h-11` below `md`); desktop unchanged.
+- **Fix:** all at least 44 px on phones (the `sm` button size gets `min-h-11` below `md`); desktop unchanged. CI (Linux fonts) then caught the pricing editor's price boxes at 34 px wide on a phone — Windows fonts had made them just wide enough locally; the bands are now a grid that wraps on phones (From/To, then price + remove) with a 5rem minimum price box.
 - **Tests:** `tests/e2e/admin-panels.spec.ts` (one test visits all nine pages on mobile with soft assertions).
 
 ### SEC-64 — gitleaks CI job failed on test fixtures · **Low** · Fixed (reviewed allowlist)

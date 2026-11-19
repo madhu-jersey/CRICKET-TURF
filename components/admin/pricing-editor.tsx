@@ -75,26 +75,35 @@ export function PricingEditor({ courts, rules }: { courts: { id: string; name: s
             <option value="HOLIDAY">Holiday</option>
           </Select>
         </div>
-        <table className="mt-4 w-full text-sm">
-          <thead>
-            <tr className="text-left text-xs uppercase text-zinc-500">
-              <th scope="col" className="pb-2">From</th>
-              <th scope="col" className="pb-2">To</th>
-              <th scope="col" className="pb-2">₹ / slot</th>
-              <th scope="col"><span className="sr-only">Remove</span></th>
-            </tr>
-          </thead>
-          <tbody>
-            {bands.map((b, i) => (
-              <tr key={i}>
-                <td className="py-1 pr-2"><Input type="time" step={1800} aria-label={`Band ${i + 1} start`} value={b.startTime} onChange={(e) => setBands(bands.map((x, k) => (k === i ? { ...x, startTime: e.target.value } : x)))} className="h-10 text-sm" /></td>
-                <td className="py-1 pr-2"><Input type="time" step={1800} aria-label={`Band ${i + 1} end`} value={b.endTime === "24:00" ? "23:59" : b.endTime} onChange={(e) => setBands(bands.map((x, k) => (k === i ? { ...x, endTime: e.target.value } : x)))} className="h-10 text-sm" /></td>
-                <td className="py-1 pr-2"><Input type="number" min={0} aria-label={`Band ${i + 1} price`} value={b.pricePerSlot} onChange={(e) => setBands(bands.map((x, k) => (k === i ? { ...x, pricePerSlot: e.target.value } : x)))} className="h-10 text-sm" data-testid={`price-${i}`} /></td>
-                <td className="py-1"><button type="button" onClick={() => setBands(bands.filter((_, k) => k !== i))} className="inline-flex min-h-11 min-w-11 items-center justify-center text-sm font-bold text-red-700 md:min-h-0 md:min-w-0" aria-label={`Remove band ${i + 1}`}>✕</button></td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        {/* Bands: one row of four on wider screens; on phones From/To, then price + remove, so the price
+            box is never squeezed (it was 34 px wide on a phone). [SEC-63] */}
+        <div className="mt-4 hidden grid-cols-[1fr_1fr_7rem_2.75rem] gap-2 text-xs font-semibold uppercase text-zinc-500 sm:grid" aria-hidden>
+          <span>From</span>
+          <span>To</span>
+          <span>₹ / slot</span>
+          <span />
+        </div>
+        <div className="mt-2 space-y-3 text-sm sm:space-y-1">
+          {bands.map((b, i) => (
+            <div key={i} className="grid grid-cols-2 items-end gap-2 rounded-xl border border-zinc-200 p-2 sm:grid-cols-[1fr_1fr_7rem_2.75rem] sm:rounded-none sm:border-0 sm:p-0">
+              <label className="block min-w-0">
+                <span className="mb-1 block text-xs font-semibold text-zinc-500 sm:hidden">From</span>
+                <Input type="time" step={1800} aria-label={`Band ${i + 1} start`} value={b.startTime} onChange={(e) => setBands(bands.map((x, k) => (k === i ? { ...x, startTime: e.target.value } : x)))} className="h-11 w-full min-w-0 text-sm sm:h-10" />
+              </label>
+              <label className="block min-w-0">
+                <span className="mb-1 block text-xs font-semibold text-zinc-500 sm:hidden">To</span>
+                <Input type="time" step={1800} aria-label={`Band ${i + 1} end`} value={b.endTime === "24:00" ? "23:59" : b.endTime} onChange={(e) => setBands(bands.map((x, k) => (k === i ? { ...x, endTime: e.target.value } : x)))} className="h-11 w-full min-w-0 text-sm sm:h-10" />
+              </label>
+              <label className="block min-w-0">
+                <span className="mb-1 block text-xs font-semibold text-zinc-500 sm:hidden">₹ / slot</span>
+                <Input type="number" inputMode="numeric" min={0} aria-label={`Band ${i + 1} price`} value={b.pricePerSlot} onChange={(e) => setBands(bands.map((x, k) => (k === i ? { ...x, pricePerSlot: e.target.value } : x)))} className="h-11 w-full min-w-[5rem] text-sm sm:h-10" data-testid={`price-${i}`} />
+              </label>
+              <div className="flex justify-end sm:justify-center">
+                <button type="button" onClick={() => setBands(bands.filter((_, k) => k !== i))} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg text-sm font-bold text-red-700 hover:bg-red-50 sm:min-h-10 sm:min-w-10" aria-label={`Remove band ${i + 1}`}>✕</button>
+              </div>
+            </div>
+          ))}
+        </div>
         {bands.length === 0 && <p className="mt-2 text-sm text-zinc-500">{dayType === "WEEKDAY" ? "No prices — slots will be unbookable." : `No ${dayType.toLowerCase()} prices — ${dayType === "HOLIDAY" ? "weekend" : "weekday"} prices apply.`}</p>}
         <button type="button" onClick={() => setBands([...bands, { startTime: "18:00", endTime: "23:59", pricePerSlot: "" }])} className="mt-2 inline-flex min-h-11 items-center text-sm font-semibold underline md:min-h-0">+ Add time band</button>
         <label className="mt-4 flex min-h-11 items-center gap-3 text-sm"><input type="checkbox" className="h-5 w-5" checked={applyToSport} onChange={(e) => setApplyToSport(e.target.checked)} />Apply to all {court?.sport === "PICKLEBALL" ? "pickleball" : "cricket"} courts</label>
