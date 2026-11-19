@@ -70,6 +70,8 @@ export const customers = pgTable("Customer", {
   blockedAt: ts("blockedAt"),
   blockedReason: text("blockedReason"),
   trustEpoch: integer("trustEpoch").notNull().default(0),
+  /** No-shows for slots before this don't count toward auto-blocking (set on unblock). [SEC-57] */
+  noShowResetAt: ts("noShowResetAt"),
   createdAt: ts("createdAt").notNull().defaultNow(),
 });
 
@@ -217,6 +219,7 @@ export const settings = pgTable("Settings", {
   address: text("address").notNull(),
   mapLink: text("mapLink").notNull(),
   phone: text("phone").notNull(),
+  autoCompleteHours: integer("autoCompleteHours").notNull().default(6),
   updatedAt: ts("updatedAt").notNull().defaultNow(),
 });
 

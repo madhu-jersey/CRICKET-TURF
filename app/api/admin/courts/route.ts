@@ -7,6 +7,7 @@ import { getDb, schema } from "@/db/client";
 import { closeTimeSchema, idSchema, sanitizeText, timeSchema } from "@/lib/validation";
 import { timeToMinutes } from "@/lib/time";
 import { audit } from "@/lib/audit";
+import { invalidateAllAvailability, invalidateCourtConfig } from "@/lib/booking/availability-cache";
 
 const patch = z.object({
   id: idSchema,
@@ -41,5 +42,6 @@ export const PATCH = adminRoute("OWNER", async (req, { admin }) => {
       await audit(tx, { actor: admin.email, action: "court.hours", entity: "Court", entityId: b.id, before: before.map(({ dayOfWeek, openTime, closeTime, isClosed }) => ({ dayOfWeek, openTime, closeTime, isClosed })), after: b.hours });
     }
   });
+  await invalidateCourtConfig([b.id]); // hours / active flag changed [SEC-60]
   return NextResponse.json({ ok: true });
 });

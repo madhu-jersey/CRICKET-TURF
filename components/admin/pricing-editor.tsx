@@ -90,14 +90,14 @@ export function PricingEditor({ courts, rules }: { courts: { id: string; name: s
                 <td className="py-1 pr-2"><Input type="time" step={1800} aria-label={`Band ${i + 1} start`} value={b.startTime} onChange={(e) => setBands(bands.map((x, k) => (k === i ? { ...x, startTime: e.target.value } : x)))} className="h-10 text-sm" /></td>
                 <td className="py-1 pr-2"><Input type="time" step={1800} aria-label={`Band ${i + 1} end`} value={b.endTime === "24:00" ? "23:59" : b.endTime} onChange={(e) => setBands(bands.map((x, k) => (k === i ? { ...x, endTime: e.target.value } : x)))} className="h-10 text-sm" /></td>
                 <td className="py-1 pr-2"><Input type="number" min={0} aria-label={`Band ${i + 1} price`} value={b.pricePerSlot} onChange={(e) => setBands(bands.map((x, k) => (k === i ? { ...x, pricePerSlot: e.target.value } : x)))} className="h-10 text-sm" data-testid={`price-${i}`} /></td>
-                <td className="py-1"><button type="button" onClick={() => setBands(bands.filter((_, k) => k !== i))} className="text-sm font-bold text-red-700" aria-label={`Remove band ${i + 1}`}>✕</button></td>
+                <td className="py-1"><button type="button" onClick={() => setBands(bands.filter((_, k) => k !== i))} className="inline-flex min-h-11 min-w-11 items-center justify-center text-sm font-bold text-red-700 md:min-h-0 md:min-w-0" aria-label={`Remove band ${i + 1}`}>✕</button></td>
               </tr>
             ))}
           </tbody>
         </table>
         {bands.length === 0 && <p className="mt-2 text-sm text-zinc-500">{dayType === "WEEKDAY" ? "No prices — slots will be unbookable." : `No ${dayType.toLowerCase()} prices — ${dayType === "HOLIDAY" ? "weekend" : "weekday"} prices apply.`}</p>}
-        <button type="button" onClick={() => setBands([...bands, { startTime: "18:00", endTime: "23:59", pricePerSlot: "" }])} className="mt-2 text-sm font-semibold underline">+ Add time band</button>
-        <label className="mt-4 flex items-center gap-2 text-sm"><input type="checkbox" checked={applyToSport} onChange={(e) => setApplyToSport(e.target.checked)} />Apply to all {court?.sport === "PICKLEBALL" ? "pickleball" : "cricket"} courts</label>
+        <button type="button" onClick={() => setBands([...bands, { startTime: "18:00", endTime: "23:59", pricePerSlot: "" }])} className="mt-2 inline-flex min-h-11 items-center text-sm font-semibold underline md:min-h-0">+ Add time band</button>
+        <label className="mt-4 flex min-h-11 items-center gap-3 text-sm"><input type="checkbox" className="h-5 w-5" checked={applyToSport} onChange={(e) => setApplyToSport(e.target.checked)} />Apply to all {court?.sport === "PICKLEBALL" ? "pickleball" : "cricket"} courts</label>
         {error && <Alert className="mt-3">{error}</Alert>}
         {ok && <Alert tone="success" className="mt-3">{ok}</Alert>}
         <Button variant="dark" className="mt-4" onClick={save} loading={busy} data-testid="save-pricing">Save {dayType.toLowerCase()} prices</Button>

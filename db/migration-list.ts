@@ -13,6 +13,7 @@ export const MIGRATIONS = [
   "0007_admin_recovery_codes.sql",
   "0008_pending_refunds.sql",
   "0009_refund_reconcile.sql",
+  "0010_noshow_reset_autocomplete.sql",
 ] as const;
 
 /** Expected migrations that the database hasn't applied, in order. */

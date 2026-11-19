@@ -13,7 +13,8 @@ const variants: Record<Variant, string> = {
   light: "border border-zinc-300 bg-white text-ink hover:border-ink",
 };
 const sizes: Record<Size, string> = {
-  sm: "h-9 px-3.5 text-sm",
+  // 44 px tall on phones (finger), 36 px from md up. [SEC-42][SEC-63]
+  sm: "h-9 min-h-11 px-3.5 text-sm md:min-h-0",
   md: "h-11 px-5 text-[15px]",
   lg: "h-14 px-7 text-base",
 };

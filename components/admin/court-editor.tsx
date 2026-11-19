@@ -44,9 +44,10 @@ export function CourtEditor({ court, hours: initial }: { court: { id: string; na
           <h2 className="font-display text-2xl font-bold uppercase">{court.name}</h2>
           <p className="text-xs text-zinc-500">{court.sport.toLowerCase()}</p>
         </div>
-        <label className="flex items-center gap-2 text-sm font-semibold">
+        <label className="flex min-h-11 items-center gap-3 text-sm font-semibold">
           <input
             type="checkbox"
+            className="h-5 w-5"
             checked={active}
             disabled={busy}
             onChange={async (e) => {
@@ -65,7 +66,7 @@ export function CourtEditor({ court, hours: initial }: { court: { id: string; na
             return (
               <tr key={d} className="border-t border-zinc-100">
                 <th scope="row" className="py-1.5 pr-2 text-left font-semibold">{DAYS[d]}</th>
-                <td className="py-1.5 pr-2"><label className="flex items-center gap-1 text-xs"><input type="checkbox" checked={h.isClosed} onChange={(e) => set(d, { isClosed: e.target.checked })} />Closed</label></td>
+                <td className="py-1.5 pr-2"><label className="flex min-h-11 items-center gap-2 text-xs md:min-h-0"><input type="checkbox" className="h-5 w-5" checked={h.isClosed} onChange={(e) => set(d, { isClosed: e.target.checked })} />Closed</label></td>
                 <td className="py-1.5 pr-1"><Input type="time" step={1800} aria-label={`${DAYS[d]} opens`} disabled={h.isClosed} value={h.openTime} onChange={(e) => set(d, { openTime: e.target.value })} className="h-9 text-sm" /></td>
                 <td className="py-1.5"><Input type="time" step={1800} aria-label={`${DAYS[d]} closes`} disabled={h.isClosed} value={h.closeTime === "24:00" ? "23:59" : h.closeTime} onChange={(e) => set(d, { closeTime: e.target.value === "23:59" ? "24:00" : e.target.value })} className="h-9 text-sm" /></td>
               </tr>

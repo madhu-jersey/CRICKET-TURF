@@ -264,6 +264,7 @@ Tables with no foreign keys (stand-alone): `OtpRequest`, `AuditLog`, `RateLimitH
 | whatsappOptIn, optInAt | boolean, timestamptz | opt-in for customer messages |
 | isBlocked, blockedAt, blockedReason | boolean, timestamptz, text | blocked numbers can't book online (0005) |
 | trustEpoch | integer | bump to revoke trusted-device cookies (0006) |
+| noShowResetAt | timestamptz | set on unblock; auto-block counts only no-shows for slots after it (0010) |
 | createdAt | timestamptz | |
 
 **OtpRequest** — `phone`; `codeHash` (HMAC); `expiresAt`; `attempts` (default 0); `consumedAt`; `ip`; `createdAt`. Index (`phone`, `createdAt DESC`).
@@ -391,6 +392,9 @@ Row locks (`SELECT … FOR UPDATE`): Customer row in `upsertCustomer()`; Payment
 | `0007_admin_recovery_codes.sql` | `AdminRecoveryCode`; `AdminUser.recoveryCodesAt` |
 | `0008_pending_refunds.sql` | `Booking.refundPendingAmount` (≥ 0) + partial index |
 | `0009_refund_reconcile.sql` | Payment in-flight refund key/amount/time; Booking `refundPendingSince`, `refundAttempts`, `refundNeedsManual` |
+| `0010_noshow_reset_autocomplete.sql` | `Customer.noShowResetAt`; `Settings.autoCompleteHours` (default 6, 0–72) |
+
+`db/migration-list.ts` must list every file (a test checks); the live startup check uses it.
 
 The runner wraps each file in `BEGIN … COMMIT` together with its `_migrations` insert. There are no down migrations.
 
@@ -414,7 +418,7 @@ stateDiagram-v2
   CONFIRMED --> CANCELLED: customer or admin cancel, no refund
   PENDING_PAYMENT --> REFUNDED: cancel with refund
   CONFIRMED --> REFUNDED: cancel with refund
-  CONFIRMED --> COMPLETED: staff, after start
+  CONFIRMED --> COMPLETED: staff after start, or cron autoCompleteHours after end
   CONFIRMED --> NO_SHOW: staff, after start
   COMPLETED --> NO_SHOW: staff correction
   NO_SHOW --> COMPLETED: staff correction
@@ -431,11 +435,12 @@ stateDiagram-v2
 | EXPIRED → CONFIRMED / CANCELLED → REFUNDED | Late payment | `confirmPayment()` (savepoint + court-day lock) |
 | → CANCELLED / REFUNDED | Customer cancel (`by: CUSTOMER`) or admin cancel (`by: ADMIN`) | `cancelBooking()` |
 | CONFIRMED ↔ COMPLETED / NO_SHOW | Staff action, only after `startAt` | `setBookingOutcome()` |
+| CONFIRMED → COMPLETED (automatic) | Cron, `autoCompleteHours` (default 6) after `endAt`; never sets NO_SHOW | `autoCompleteBookings()` (SEC-59) |
 | CANCELLED / EXPIRED → REFUNDED | Owner "refund" action on a booking that still holds money | `refundCancelledBooking()` (NO_SHOW stays NO_SHOW) |
 
 Notes:
 
-- Nothing marks bookings `COMPLETED` automatically. Past confirmed bookings stay `CONFIRMED` until staff mark them.
+- The cron marks confirmed bookings `COMPLETED` `autoCompleteHours` after they end (0 turns it off). Staff can still switch COMPLETED ↔ NO_SHOW, and only staff can set NO_SHOW, so auto-blocking counts only staff-marked no-shows.
 - `REFUNDED` means money went back; a cancellation with nothing to refund stays `CANCELLED`.
 - If a refund call fails (customer cancel, admin cancel or late-payment auto-refund), the booking stays `CANCELLED` with `refundPendingAmount` set, `booking.refund_failed` is audit-logged and the owner is alerted. The 15-minute cron retries it; on success the booking becomes `REFUNDED` (SEC-45).
 - A second payment for an already `CONFIRMED`/`COMPLETED` booking, or any payment for `CANCELLED`/`REFUNDED`/`NO_SHOW`, is refunded and the booking is not revived (`REFUND_NOT_BOOKABLE`).
@@ -516,8 +521,8 @@ sequenceDiagram
    - Customer view: dates from today (IST) to today + `maxDaysAhead` − 1; other dates return no slots.
    - Loads that weekday's hours, all pricing rules for the court, blocks and bookings overlapping the IST day (`PENDING_PAYMENT`, `CONFIRMED`, `COMPLETED`, `NO_SHOW`), and whether the date is a holiday.
    - `lib/booking/slots.ts › generateSlots()` walks from open to close in `slotDurationMinutes` steps (60 for both sports). Each slot is `PAST` (started), `BLOCKED` (overlaps a block, or no price rule covers it), `BOOKED` (overlaps an active booking; an expired hold counts as free) or `AVAILABLE`.
-5. Invalidation: `invalidateAvailability(courtId, startAt)` bumps the version after a hold, a payment outcome other than a plain confirm, a cancel, a walk-in, block creation, block deletion and cron expiry. Price, hours and holiday edits are **not** invalidated; they show within 12 s.
-6. The form re-polls every 30 s (`components/booking/booking-form.tsx`). The hold step re-validates against live data inside its own transaction, so a stale grid can never cause a double booking.
+5. Invalidation: an entry is valid only while three shared versions are unchanged (SEC-60): `avail:<court>:<day>` (bumped by `invalidateAvailability()` after a hold, a payment outcome other than a plain confirm, a cancel, a walk-in, block creation/deletion and cron expiry), `availcfg:<court>` (bumped by `invalidateCourtConfig()` when pricing, hours, name or active flag change) and `availcfg:all` (bumped by `invalidateAllAvailability()` when holidays or Settings change). So every edit shows on the next poll.
+6. The form re-polls every 30 s (`components/booking/booking-form.tsx`). The hold step re-validates against live data inside its own transaction, so a stale grid can never cause a double booking. If the server's total or advance differs from what the form showed (price edited, or the offer no longer applies), the form shows "Price updated" with the server's amounts and doesn't open payment by itself (SEC-61).
 
 Failure paths: DB error → 500 generic message. Version read failure is not caught in `getCachedAvailability()` (only invalidation swallows errors).
 
@@ -648,6 +653,7 @@ Failure paths: the refund runs after the transaction commits, with a stored refu
    - `sendReminders()` claims bookings with one `UPDATE … SET reminderSentAt = now WHERE status = CONFIRMED AND reminderSentAt IS NULL AND startAt in (now, now + 2 h] RETURNING id`, so two overlapping runs can't both send. Each gets a `booking_reminder` message (dedupe key `booking_reminder:<id>`), only if opted in.
    - `redispatchStuck()` re-sends up to 50 messages stuck in `QUEUED` for more than 2 minutes. Masked OTP messages are marked `FAILED` ("Expired before delivery") instead.
    - `reconcileInFlightRefunds()` (runs first) takes refunds whose outcome was unknown and are older than 1 minute, lists the payment's refunds at Razorpay (`GET /v1/payments/{id}/refunds`) and matches our key: found → recorded as refunded; not found → the reservation is released so the retry below can try again; lookup failed → next run (SEC-49).
+   - `autoCompleteBookings()` marks confirmed bookings `COMPLETED` `autoCompleteHours` after `endAt` (SEC-59); `cleanupLimiterTables()` deletes `RateLimitHit` rows older than 48 h and expired `Counter` rows, at most 10 000 of each per run (SEC-58).
    - `retryPendingRefunds()` takes up to 20 bookings with `refundPendingAmount > 0` that haven't given up. After 20 failed attempts or 24 hours since the first failure it marks the booking `refundNeedsManual`, stops retrying and sends the owner one alert; the Overview page then shows it under "Refunds needing attention" with a "Mark refunded" button (owner, audit-logged, `markRefundedManually()`).
    - Otherwise it claims each pending amount by setting it to 0 only if unchanged (so overlapping runs can't both refund), refunds it online-first, and puts back whatever still fails, counting the attempt, with another owner alert (one per booking per day). Success adds to `refundAmount`, sets `REFUNDED` for cancelled/expired bookings and sends `booking_cancelled` (SEC-45).
 3. Correctness never depends on the crons: availability treats expired holds as free, and inserts expire overlapping stale holds themselves.
@@ -762,9 +768,9 @@ Per-phone online limits and blocked-number checks do **not** apply to staff book
 
 1. `POST /api/admin/bookings/[id] {action: "no_show"}` (STAFF or OWNER) → `setBookingOutcome(id, "NO_SHOW")`.
 2. Allowed only for `CONFIRMED`, `COMPLETED` or `NO_SHOW` bookings and only after `startAt`.
-3. If `noShowBlockThreshold` (3) > 0 and the customer now has at least that many `NO_SHOW` bookings, the customer is set `isBlocked = true`, `blockedReason = "<n> no-shows"`, and `trustEpoch` is bumped (only if not already blocked). Audit `customer.auto_block`.
+3. If `noShowBlockThreshold` (3) > 0 and the customer now has at least that many `NO_SHOW` bookings for slots that started after `Customer.noShowResetAt` (all of them if never unblocked), the customer is set `isBlocked = true`, `blockedReason = "<n> no-shows"`, and `trustEpoch` is bumped (only if not already blocked). Audit `customer.auto_block`.
 4. Blocked numbers get the generic "We can't take this booking online. Please call …" message at the hold step, and trusted-device skips stop working for them.
-5. The owner can unblock from Customers (`PATCH /api/admin/customers`). Unblocking does not reset the no-show count.
+5. The owner can unblock from Customers (`PATCH /api/admin/customers`). Unblocking sets `noShowResetAt`, so the count starts again (SEC-57).
 
 ### 6.11 WhatsApp message sending
 
@@ -1043,7 +1049,7 @@ Every admin write is audit-logged (`lib/audit.ts`).
 
 Two mechanisms exist:
 
-- **Sliding window** — `lib/ratelimit.ts › hitRateLimit()`: one `RateLimitHit` row per allowed request, counted under an advisory lock. **Always Postgres**, even when Upstash is configured. Old rows (> 48 h) are deleted on about 2 % of calls.
+- **Sliding window** — `lib/ratelimit.ts › hitRateLimit()`: one `RateLimitHit` row per allowed request, counted under an advisory lock. **Always Postgres**, even when Upstash is configured. Rows older than 48 h are deleted by the 15-minute cron (`cleanupLimiterTables()`, at most 10 000 per run, SEC-58).
 - **Fixed window** — `lib/counter.ts › windowLimit()` / counters: one `Counter` row per key per window (atomic UPSERT), or Upstash Redis (`INCRBY` + `PEXPIREAT`) when `UPSTASH_REDIS_REST_URL` is set.
 
 | Key | Scope | Limit | Window | Mechanism | Settings field |
@@ -1072,7 +1078,6 @@ Two mechanisms exist:
 | `files:<ip>` | IP | 300 | 60 s | fixed | — |
 | OTP / admin code attempts | code | 5 | per code | row counter | — |
 
-`lib/ratelimit.ts › memoryRateLimit()` (per-instance, in-memory) still exists but nothing calls it.
 
 ### Security headers and CSP
 
@@ -1162,7 +1167,8 @@ Warnings only: `ADMIN_2FA_REQUIRED=false`; `SENTRY_DSN` not set.
 | `refundPercentAfterCutoff` | 0 | 0–100 | |
 | `maxActiveBookingsPerPhone` | 2 | 1–20 | Upcoming bookings per number |
 | `maxBookingsPerPhonePerDay` | 4 | 1–50 | New bookings per number per 24 h |
-| `noShowBlockThreshold` | 3 | 0–20 | Auto-block after N no-shows (0 = off) |
+| `noShowBlockThreshold` | 3 | 0–20 | Auto-block after N no-shows since the last unblock (0 = off) |
+| `autoCompleteHours` | 6 | 0–72 | Confirmed bookings become COMPLETED this many hours after they end (0 = off) |
 | `otpDailyCapNew`, `otpDailyCapReturning` | 200, 300 | 10–100000 | Daily code caps |
 | `otpCapBoost`, `otpCapBoostDate` | 0, null | — | Set only by "Raise today's limits" |
 | `otpSendPerIpHour`, `otpVerifyPerIpHour` | 30, 60 | 1–10000 | Per-network OTP limits |
@@ -1247,25 +1253,25 @@ Background work inside requests (`runInBackground()`) uses `after()`, so on Verc
 | `tests/e2e/` | Playwright (desktop Chrome + Pixel 7) | Booking happy path, payment failure/retry, cancel with refund, held slot, offer rule, admin flows, admin pages on mobile with tap-target checks | `npx playwright test` |
 | `tests/security/http.spec.ts` | Playwright (desktop only) | Headers, admin route access matrix, cron auth, payment forgery, tampering, XSS, body size, 2FA, recovery codes, policy propagation, fresh-OTP refunds | `npx playwright test tests/security` |
 
-`npm test` runs every Vitest suite on PGlite. `npm run test:realdb` runs every Vitest suite on real Postgres. Playwright builds into `.next-e2e` and starts an isolated server on port 3100 with a fresh PGlite DB, mock providers and `ADMIN_2FA_REQUIRED=true` (`scripts/e2e-server.mjs`).
+`npm test` runs every Vitest suite on PGlite. `npm run test:realdb` runs every Vitest suite on real Postgres. **`npm run release:check`** runs typecheck, `test`, `test:realdb`, `test:concurrency` and Playwright, and is required before every deploy. `tests/unit/raw-sql.test.ts` fails if a raw `sql` fragment embeds a JS date (the SEC-48 bug class, SEC-62). Playwright builds into `.next-e2e` and starts an isolated server on port 3100 with a fresh PGlite DB, mock providers and `ADMIN_2FA_REQUIRED=true` (`scripts/e2e-server.mjs`).
 
 ### PGlite vs real Postgres
 
-- PGlite (`tests/support/test-db.ts`, `TEST_DATABASE_URL` unset): in-memory, one connection, so queries never truly overlap. Fast. The 10 race tests skip themselves.
+- PGlite (`tests/support/test-db.ts`, `TEST_DATABASE_URL` unset): in-memory, one connection, so queries never truly overlap. Fast. The 11 real-Postgres tests skip themselves.
 - Real Postgres (`TEST_DATABASE_URL` set, or `scripts/test-concurrency.mjs` starts an embedded Postgres 17): 25-connection pool, a fresh schema per test, and `overlap()` samples `pg_stat_activity` to prove more than one backend was busy at once. The helper refuses hosts outside localhost/127.0.0.1/::1/postgres unless listed in `TEST_DB_ALLOWED_HOSTS`, and refuses a URL equal to `DATABASE_URL`.
 
 ### Current counts (19 Nov 2026)
 
 | Suite | File(s) | Tests |
 |---|---|---|
-| Unit | `pricing.test.ts` 10, `security.test.ts` 13, `slots.test.ts` 16 | 39 |
+| Unit | `pricing.test.ts` 10, `security.test.ts` 13, `slots.test.ts` 16, `raw-sql.test.ts` 2 | 41 |
 | Integration | `booking.test.ts` | 26 |
-| Security (Vitest) | `abuse.test.ts` 27, `followup.test.ts` 18, `recovery-refund.test.ts` 11, `review-fixes.test.ts` 6 | 62 |
-| Concurrency | `races.test.ts` | 10 |
-| **Vitest total** | | **137** (127 pass + 10 skipped on PGlite; 137/137 on real Postgres) |
-| E2E | `booking.spec.ts` 5, `admin.spec.ts` 1, `admin-panels.spec.ts` 4 | 10 per project |
-| HTTP security | `http.spec.ts` | 14 (desktop only) |
-| **Playwright total** | 24 tests × 2 projects | **33 pass, 15 skipped** (desktop-only on mobile) |
+| Security (Vitest) | `abuse.test.ts` 27, `followup.test.ts` 18, `recovery-refund.test.ts` 11, `review-fixes.test.ts` 6, `hardening-p1.test.ts` 8, `hardening-p2.test.ts` 12, `hardening-p3.test.ts` 5 | 87 |
+| Concurrency | `races.test.ts` 10, `deploy-migrate.test.ts` 1 | 11 |
+| **Vitest total** | | **165** (154 pass + 11 skipped on PGlite; 165/165 on real Postgres) |
+| E2E | `booking.spec.ts` 5, `admin.spec.ts` 1, `admin-panels.spec.ts` 5 | 11 desktop, 10 mobile |
+| HTTP security | `http.spec.ts` | 16 (desktop only) |
+| **Playwright total** | 27 tests × 2 projects | **37 pass, 17 skipped** (desktop-only on mobile) |
 
 ### CI (`.github/workflows/security.yml`)
 
@@ -1287,7 +1293,6 @@ All jobs except `zap` run in parallel.
 
 - Real providers (Razorpay, Meta, BSP, MSG91, Turnstile, Supabase, Upstash) are never called; adapters are tested only through mocks and signature maths.
 - Crons are tested as functions, not through Vercel's scheduler.
-- Pricing, courts, team, audit and gallery admin pages are not checked for mobile tap targets.
 - No load test beyond 50 parallel bookings.
 
 ---
@@ -1348,13 +1353,11 @@ The first draft of this document found four defects; fixing them exposed a fifth
 ### Remaining risks
 
 1. **Unblocking a customer doesn't reset their no-show count**, so their next no-show re-blocks them immediately.
-2. **The sliding-window limiter writes one row per request** to `RateLimitHit`, always in Postgres, even when Upstash is configured. Cleanup is probabilistic (about 2 % of calls delete rows older than 48 h).
+2. **The sliding-window limiter writes one row per request** to `RateLimitHit`, always in Postgres, even when Upstash is configured (cleaned by the cron, up to 10 000 rows per run).
 3. **The availability cache is per instance** and still reads `CacheVersion` from the DB on every poll; it saves the grid computation, not the round trip.
-4. **Nothing marks bookings `COMPLETED`** automatically; reports that count completed bookings depend on staff.
-5. **Only PGlite runs in the default `npm test`**, and SEC-48 shows PGlite can accept SQL that real Postgres rejects. CI runs `test:realdb`, but local runs should too before a release.
-6. `memoryRateLimit()` in `lib/ratelimit.ts` is dead code.
-7. **An OTP WhatsApp send that answers after the 5 s deadline** is logged `FAILED` even if WhatsApp later delivers it; the customer may receive the same code by both WhatsApp and SMS (harmless).
-8. **Refund reconciliation trusts Razorpay's refund list** right after a timeout (after a 1-minute grace period). A refund that appears in the list later than that would be retried; Razorpay's guidance is that refunds are listed immediately.
+4. **Only PGlite runs in the default `npm test`**, and SEC-48 shows PGlite can accept SQL that real Postgres rejects. CI runs `test:realdb`, but local runs should too before a release.
+5. **An OTP WhatsApp send that answers after the 5 s deadline** is logged `FAILED` even if WhatsApp later delivers it; the customer may receive the same code by both WhatsApp and SMS (harmless).
+6. **Refund reconciliation trusts Razorpay's refund list** right after a timeout (after a 1-minute grace period). A refund that appears in the list later than that would be retried; Razorpay's guidance is that refunds are listed immediately.
 
 ### Not done or not verified
 

@@ -26,7 +26,7 @@ export function DeleteButton({ url, label = "Delete", confirmText = "Are you sur
             setBusy(false);
           }
         }}
-        className="rounded-lg border border-red-300 px-3 py-1 text-xs font-bold text-red-700 hover:bg-red-50 disabled:opacity-50"
+        className="inline-flex min-h-11 items-center rounded-lg border border-red-300 px-3 text-xs font-bold text-red-700 hover:bg-red-50 disabled:opacity-50 md:min-h-0 md:py-1"
       >
         {busy ? "…" : label}
       </button>

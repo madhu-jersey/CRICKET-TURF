@@ -15,8 +15,8 @@ export default async function CustomersPage({ searchParams }: { searchParams: Pr
     <>
       <PageHeader title="Customers" />
       <form className="mb-4 flex gap-2" method="get">
-        <input name="q" defaultValue={q} placeholder="Search name or phone" aria-label="Search customers" className="h-10 w-full max-w-sm rounded-lg border border-zinc-300 bg-white px-3 text-sm" />
-        <button className="h-10 rounded-lg bg-ink px-4 text-sm font-bold text-white">Search</button>
+        <input name="q" defaultValue={q} placeholder="Search name or phone" aria-label="Search customers" className="h-11 w-full max-w-sm rounded-lg border border-zinc-300 bg-white px-3 text-base md:h-10 md:text-sm" />
+        <button className="h-11 rounded-lg bg-ink px-4 text-sm font-bold text-white md:h-10">Search</button>
       </form>
       <div className="overflow-x-auto rounded-2xl border border-zinc-200 bg-white">
         <table className="w-full min-w-[640px] text-left text-sm">

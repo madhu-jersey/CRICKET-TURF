@@ -100,6 +100,7 @@ export function SettingsForm({
         <Num f={f} id="maxActiveBookingsPerPhone" label="Max upcoming bookings per number" min={1} max={20} />
         <Num f={f} id="maxBookingsPerPhonePerDay" label="Max new bookings per number per day" min={1} max={50} />
         <Num f={f} id="noShowBlockThreshold" label="Block after this many no-shows (0 = never)" min={0} max={20} />
+        <Num f={f} id="autoCompleteHours" label="Mark played automatically this many hours after the slot ends (0 = off)" min={0} max={72} hint="Staff can still change a booking to no-show afterwards." />
         <div />
         <Num f={f} id="otpDailyCapNew" label="Daily OTP limit — new numbers" min={10} max={100000} hint={`Today: ${otpToday.new.used} / ${otpToday.new.cap}`} />
         <Num f={f} id="otpDailyCapReturning" label="Daily OTP limit — returning customers" min={10} max={100000} hint={`Today: ${otpToday.returning.used} / ${otpToday.returning.cap}`} />

@@ -1,5 +1,5 @@
 /** Sliding-window rate limiter backed by Postgres, so it works across serverless instances. */
-import { and, count, eq, gt, lt, sql } from "drizzle-orm";
+import { and, count, eq, gt, inArray, lt, sql } from "drizzle-orm";
 import { getDb, schema } from "@/db/client";
 import { AppError } from "@/lib/errors";
 
@@ -20,10 +20,29 @@ export async function hitRateLimit(key: string, limit: number, windowMs: number,
     await tx.insert(schema.rateLimitHits).values({ key, createdAt: now });
     return true;
   });
-  if (Math.random() < 0.02) {
-    await db.delete(schema.rateLimitHits).where(lt(schema.rateLimitHits.createdAt, new Date(now.getTime() - 48 * 3_600_000)));
-  }
   return allowed;
+}
+
+/** Rows older than this are never needed (the longest window is 24 h). */
+export const LIMITER_RETENTION_MS = 48 * 3_600_000;
+
+/**
+ * Cron cleanup (replaces the old random 2 % / 1 % cleanups, which ran inside user requests and used
+ * the real clock): deletes RateLimitHit rows older than 48 h and expired Counter rows, at most
+ * `batch` of each per run so one run can't lock the tables for long. [SEC-58]
+ */
+export async function cleanupLimiterTables(now = new Date(), batch = 10_000) {
+  const db = await getDb();
+  const cutoff = new Date(now.getTime() - LIMITER_RETENTION_MS);
+  const hits = await db
+    .delete(schema.rateLimitHits)
+    .where(inArray(schema.rateLimitHits.id, db.select({ id: schema.rateLimitHits.id }).from(schema.rateLimitHits).where(lt(schema.rateLimitHits.createdAt, cutoff)).limit(batch)))
+    .returning({ id: schema.rateLimitHits.id });
+  const counters = await db
+    .delete(schema.counters)
+    .where(inArray(schema.counters.key, db.select({ key: schema.counters.key }).from(schema.counters).where(lt(schema.counters.expiresAt, now)).limit(batch)))
+    .returning({ key: schema.counters.key });
+  return { rateLimitHits: hits.length, counters: counters.length };
 }
 
 export async function enforceRateLimit(key: string, limit: number, windowMs: number, message = "Too many requests. Please wait a few minutes and try again.") {
@@ -49,17 +68,4 @@ export function ipFromHeaders(h: Headers): string {
     if (parts.length) return parts[parts.length - 1].slice(0, 64);
   }
   return "unknown";
-}
-
-/** Cheap per-instance limiter for high-frequency, read-only endpoints (no DB write per request). */
-const buckets = new Map<string, { n: number; reset: number }>();
-export function memoryRateLimit(key: string, limit: number, windowMs: number, now = Date.now()): boolean {
-  const b = buckets.get(key);
-  if (!b || b.reset <= now) {
-    buckets.set(key, { n: 1, reset: now + windowMs });
-    if (buckets.size > 10_000) for (const [k, v] of buckets) if (v.reset <= now) buckets.delete(k);
-    return true;
-  }
-  b.n++;
-  return b.n <= limit;
 }

@@ -72,6 +72,7 @@ npx playwright install chromium
 npm run test:e2e         # builds into .next-e2e, starts a fresh server on :3100, runs desktop + mobile
 npm run test:concurrency # race tests on REAL Postgres, 25 parallel connections
 npm run test:realdb      # every Vitest suite on real Postgres
+npm run release:check    # REQUIRED before every deploy: typecheck + test + test:realdb + test:concurrency + Playwright
 ```
 
 ### Concurrency tests on real Postgres

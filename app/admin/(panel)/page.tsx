@@ -84,7 +84,7 @@ export default async function OverviewPage() {
               </li>
             ))}
           </ul>
-          <Link href="/admin/schedule" className="mt-2 inline-block text-sm font-semibold underline">Open schedule →</Link>
+          <Link href="/admin/schedule" className="mt-2 inline-flex min-h-11 items-center text-sm font-semibold underline md:min-h-0">Open schedule →</Link>
         </Card>
       </div>
 

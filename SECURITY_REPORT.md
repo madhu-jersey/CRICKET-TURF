@@ -13,16 +13,16 @@
 | Severity | Found | Fixed | Accepted risk | Needs owner action |
 |---|---|---|---|---|
 | Critical | 1 | 1 | – | – |
-| High | 8 | 8 | – | – |
-| Medium | 19 | 19 | – | – |
-| Low | 11 | 10 | 1 | – |
+| High | 9 | 9 | – | – |
+| Medium | 24 | 24 | – | – |
+| Low | 20 | 19 | 1 | – |
 | Info | – | – | 3 | 1 (Supabase RLS, if used) |
 
-Counts include the follow-up rounds (SEC-33 → SEC-48). Turnstile is no longer "needs owner action": a live server now refuses to start without it.
+Counts include the follow-up rounds (SEC-33 → SEC-63). Turnstile is no longer "needs owner action": a live server now refuses to start without it.
 
 **Overall risk after fixes: Low.** Every Critical, High and Medium issue is fixed and covered by an automated test. The code is **safe to go live once the go-live checklist (§5) is done**. The new startup check refuses to run a live (`DEMO_MODE=false`) server until the critical items are set.
 
-**Tests (after the fourth round, 19 Nov 2026):** 127 Vitest tests on PGlite (+10 race tests skipped there), **137/137 on real Postgres 17** (`npm run test:realdb`), **10/10 race tests** with 25 truly parallel connections (`npm run test:concurrency`), **33 Playwright tests** pass (desktop + mobile; 15 desktop-only tests skipped on mobile). All pass. `npm audit --omit=dev`: 0 vulnerabilities.
+**Tests (after the fourth round, 19 Nov 2026; superseded below):** 127 Vitest tests on PGlite (+10 race tests skipped there), **137/137 on real Postgres 17** (`npm run test:realdb`), **10/10 race tests** with 25 truly parallel connections (`npm run test:concurrency`), **33 Playwright tests** pass (desktop + mobile; 15 desktop-only tests skipped on mobile). All pass. `npm audit --omit=dev`: 0 vulnerabilities.
 
 The most important findings were:
 - **SEC-01 (Critical):** on a live site where `PAYMENT_PROVIDER` wasn't set, the demo "Simulate success" checkout still worked, so **anyone could book for free**.
@@ -317,6 +317,43 @@ Found while writing `docs/ARCHITECTURE.md` from the code (SEC-44 → SEC-47); SE
 - **Fix:** README documents Vercel Pro, Supabase `pg_cron` + `pg_net` (SQL included) and cron-job.org (bearer header), and that hourly is enough.
 - **Tests:** `hardening-p2.test.ts › SEC-56` (a run 90 minutes before start sends the reminder; the next hourly run doesn't resend).
 
+### Hardening round — P3: smaller fixes (SEC-57 → SEC-63)
+
+### SEC-57 — Unblocking a customer didn't reset their no-show count · **Low** · Fixed
+- **Fix:** `Customer.noShowResetAt` (migration 0010) is set when the owner unblocks; auto-block counts only no-shows for slots after it.
+- **Tests:** `hardening-p3.test.ts › SEC-57` (3 no-shows block; after unblock the next no-show doesn't re-block — before the fix the count would have been 4).
+
+### SEC-58 — Limiter cleanup ran randomly inside user requests · **Low** · Fixed
+- **Proof:** `hitRateLimit()` deleted old rows on ~2 % of requests and the counter store on ~1 %; the counter cleanup used the real clock, which also made a test flaky.
+- **Fix:** the 15-minute cron's `cleanupLimiterTables()` deletes `RateLimitHit` rows older than 48 h and expired `Counter` rows, at most 10 000 of each per run; the random cleanups are gone.
+- **Tests:** `hardening-p3.test.ts › SEC-58` (old removed, recent kept, batch size respected).
+
+### SEC-59 — Bookings were never marked completed automatically · **Low** · Fixed
+- **Fix:** Settings `autoCompleteHours` (default 6, 0 = off; editable in Settings). The cron marks `CONFIRMED` bookings `COMPLETED` that long after they end; it never sets `NO_SHOW`, so auto-blocking counts only staff-marked no-shows. Staff can still switch COMPLETED ↔ NO_SHOW.
+- **Tests:** `hardening-p3.test.ts › SEC-59`.
+
+### SEC-60 — Price, hours and holiday edits could show stale prices for up to 12 s · **Low** · Fixed
+- **Fix:** cache entries also carry `availcfg:<court>` and `availcfg:all` versions; pricing and courts edits bump the court's version, holiday and Settings edits bump the global one.
+- **Tests:** `hardening-p3.test.ts › SEC-60` (cached value served, then the new price/holiday immediately after invalidation); `http.spec.ts › SEC-60` (owner edits prices → the very next `/api/availability` shows them).
+
+### SEC-61 — The booking form could open payment for a price the customer hadn't seen · **Medium** · Fixed
+- **Proof:** the server always charges its own price, and the form showed the server's amounts after the hold — but the payment window opened automatically, so a price changed between grid load and "Pay" (or an offer no longer applying) went unnoticed.
+- **Fix:** if the hold's total or advance differs from what the form showed, a "Price updated" notice shows both amounts and payment waits for the customer.
+- **Tests:** `http.spec.ts › SEC-61` (browser: the owner changes every cricket price after the grid loaded → notice with the old and new totals, booking held at the server's price, payment not opened).
+
+### SEC-62 — Raw SQL audit (the SEC-48 bug class) · **Low** · Fixed (guarded)
+- **Audit:** all 32 raw `sql` fragments in app code checked. None embeds a JS `Date`; the one date value (`refundPendingSince`) is passed as `now.toISOString()::timestamptz`. Every other interpolation is a column, a number or a string.
+- **Guard:** `tests/unit/raw-sql.test.ts` scans every raw fragment and fails on date-like values that aren't converted, so the bug can't come back unnoticed; the realdb suite (in `release:check` and CI) runs every fragment on Postgres 17.
+
+### SEC-63 — Remaining admin pages had small tap targets · **Low** · Fixed
+- **Proof:** the mobile check, extended to overview, pricing, courts, gallery, team, audit, message outbox, customers and blocked slots, found: "Open schedule" link 20 px; pricing band remove ✕ 11 × 20 px, "+ Add time band" 20 px, checkboxes/radios 13 × 13 px; small `size="sm"` buttons 36–40 px; gallery move/delete buttons 22 px, file input 36 px; holiday/blocked "Remove" 26 px; pagination and outbox filter links 30 px; outbox Retry 26 px; customer search 40 px.
+- **Fix:** all at least 44 px on phones (the `sm` button size gets `min-h-11` below `md`); desktop unchanged.
+- **Tests:** `tests/e2e/admin-panels.spec.ts` (one test visits all nine pages on mobile with soft assertions).
+
+**Also:** `memoryRateLimit()` (dead code) removed; `npm run release:check` added and documented as required before every deploy.
+
+**Tests (after the hardening round, 19 Nov 2026):** Vitest 165 tests — 154 pass + 11 real-Postgres-only skipped on PGlite, **165/165 on real Postgres 17**; race + deploy-migrate suite 11/11; Playwright **37 pass**, 17 skipped (desktop-only tests on the mobile project). Typecheck clean.
+
 ### SEC-28 — Dev dependency advisory (picomatch ReDoS via vitest) · **Low** · Fixed (resolved upstream)
 - Earlier: 5 high advisories in `picomatch` inside the test runner. Re-checked 18 Nov 2026: `npm audit` and `npm audit --omit=dev` both report **0 vulnerabilities**. CI now fails on any high advisory in production dependencies.
 
@@ -406,9 +443,9 @@ Found while writing `docs/ARCHITECTURE.md` from the code (SEC-44 → SEC-47); SE
 
 | Job | What it does | Fails the build when | Local result |
 |---|---|---|---|
-| unit | `npm ci`, typecheck, `npm test` (PGlite) | any test fails | 127 passed, 10 skipped |
-| concurrency | `postgres:17` service; `npm run test:concurrency` and `npm run test:realdb` | any test fails | 10/10 and 137/137 (embedded Postgres 17) |
-| e2e | Playwright desktop + mobile, incl. HTTP security specs | any test fails | 33 passed, 15 skipped (desktop-only) |
+| unit | `npm ci`, typecheck, `npm test` (PGlite) | any test fails | 154 passed, 11 skipped |
+| concurrency | `postgres:17` service; `npm run test:concurrency` and `npm run test:realdb` | any test fails | 11/11 and 165/165 (embedded Postgres 17) |
+| e2e | Playwright desktop + mobile, incl. HTTP security specs | any test fails | 37 passed, 17 skipped (desktop-only) |
 | secrets | gitleaks over the full history (`fetch-depth: 0`) | any leak found | not run locally; regex scan: 0 hits |
 | sast | semgrep `p/nextjs p/typescript p/secrets p/owasp-top-ten` | any ERROR finding | not run locally |
 | audit | `npm audit --omit=dev --audit-level=high` | high/critical advisory | 0 vulnerabilities |
@@ -416,4 +453,12 @@ Found while writing `docs/ARCHITECTURE.md` from the code (SEC-44 → SEC-47); SE
 
 All jobs use mock providers and throwaway databases; no secrets are needed. Reports are uploaded as build artifacts. `.zap/rules.tsv` ignores only informational rules (timestamps, comments in minified bundles) and keeps the `style-src 'unsafe-inline'` finding as a warning (accepted, SEC-30).
 
-**Status: the workflow has not run yet** (branch not pushed). After the first run, record any semgrep/ZAP/gitleaks findings here as new SEC entries — fix them or mark them accepted with a reason.
+**CI results (GitHub Actions, 19 Nov 2026)** — runs on `main` @ 28f1efd and `security-hardening` @ 769a45a (P1) and 4647baa (P2):
+
+| Job | Result | Notes |
+|---|---|---|
+| unit, concurrency, e2e | ✅ pass on all three | |
+| semgrep (`p/nextjs p/typescript p/secrets p/owasp-top-ten`, fail on ERROR) | ✅ pass | No ERROR-level findings. WARNING/INFO findings, if any, are only in the `semgrep` artifact (needs a GitHub login to download) — not reviewed. |
+| npm audit (production, high+) | ✅ pass | 0 vulnerabilities |
+| ZAP baseline | ✅ pass | No FAIL-level rule fired. WARN-level alerts are only in the `zap-report` artifact — not reviewed. |
+| **gitleaks (full history)** | ❌ **fail on all three** | gitleaks ran and wrote a 9 KB report, so it found something; the log and the report both need a GitHub login, so the findings are **not known yet**. Local regex scans of the working tree and full history found no real secrets (see §6), so the likely matches are test fixtures (e.g. `e2e-secret-not-for-production-…` in `scripts/e2e-server.mjs`, test-only secrets in `vitest.config.ts` and tests). **Open:** read the findings (gitleaks run locally, or the artifact downloaded by a signed-in maintainer), rotate anything real, and allowlist confirmed test fixtures in a `.gitleaks.toml` with a reason per entry. |

@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { handle } from "@/lib/errors";
 import { assertCron } from "@/lib/auth/cron";
-import { expireHolds, reconcileInFlightRefunds, retryPendingRefunds, sendReminders } from "@/lib/booking/service";
+import { autoCompleteBookings, expireHolds, reconcileInFlightRefunds, retryPendingRefunds, sendReminders } from "@/lib/booking/service";
+import { cleanupLimiterTables } from "@/lib/ratelimit";
 import { redispatchStuck } from "@/lib/messaging";
 
 export const dynamic = "force-dynamic";
@@ -15,5 +16,7 @@ export const GET = handle(async (req: Request) => {
   // Settle refunds with an unknown outcome first (look them up by key), then retry what is still owed. [SEC-49]
   const refundsReconciled = await reconcileInFlightRefunds();
   const refundsRetried = await retryPendingRefunds();
-  return NextResponse.json({ reminders, expired, redispatched, refundsReconciled, refundsRetried });
+  const completed = await autoCompleteBookings(); // [SEC-59]
+  const cleaned = await cleanupLimiterTables(); // [SEC-58]
+  return NextResponse.json({ reminders, expired, redispatched, refundsReconciled, refundsRetried, completed, cleaned });
 });

@@ -233,8 +233,15 @@ describe("SEC-51 /api/files only serves gallery files, with a per-IP limit", () 
 
   it(`the ${FILES_PER_IP_PER_MINUTE}-per-minute limit holds per network`, async () => {
     const id = "00000000-0000-4000-8000-000000000000";
+    // Fixed one-minute windows: pin the clock (Date only) so the 301 calls can't straddle a boundary.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(Math.floor(Date.now() / 60_000) * 60_000 + 1_000));
     const statuses: number[] = [];
-    for (let i = 0; i < FILES_PER_IP_PER_MINUTE + 1; i++) statuses.push((await getFile(req("198.51.100.2"), { params: Promise.resolve({ id }) })).status);
+    try {
+      for (let i = 0; i < FILES_PER_IP_PER_MINUTE + 1; i++) statuses.push((await getFile(req("198.51.100.2"), { params: Promise.resolve({ id }) })).status);
+    } finally {
+      vi.useRealTimers();
+    }
     expect(statuses.filter((s) => s === 404)).toHaveLength(FILES_PER_IP_PER_MINUTE);
     expect(statuses.at(-1)).toBe(429);
     expect((await getFile(req("198.51.100.3"), { params: Promise.resolve({ id }) })).status).toBe(404); // another network is unaffected

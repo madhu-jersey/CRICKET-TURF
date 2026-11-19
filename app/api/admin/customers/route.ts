@@ -17,7 +17,8 @@ export const PATCH = adminRoute("OWNER", async (req, { admin }) => {
   if (!before) throw new AppError("NOT_FOUND", "Customer not found");
   const now = new Date();
   const set: Partial<typeof schema.customers.$inferInsert> = {};
-  if (b.isBlocked !== undefined) Object.assign(set, b.isBlocked ? { isBlocked: true, blockedAt: now, blockedReason: `Blocked by ${admin.email}` } : { isBlocked: false, blockedAt: null, blockedReason: null });
+  // Unblocking also restarts the no-show count (noShowResetAt). [SEC-57]
+  if (b.isBlocked !== undefined) Object.assign(set, b.isBlocked ? { isBlocked: true, blockedAt: now, blockedReason: `Blocked by ${admin.email}` } : { isBlocked: false, blockedAt: null, blockedReason: null, noShowResetAt: now });
   // Blocking or an explicit revoke signs the number out of every trusted device. [SEC-35]
   if (b.isBlocked || b.revokeTrustedDevices) Object.assign(set, { trustEpoch: before.trustEpoch + 1 });
   if (b.whatsappOptIn !== undefined) Object.assign(set, { whatsappOptIn: b.whatsappOptIn, optInAt: b.whatsappOptIn ? now : null });

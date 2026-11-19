@@ -1024,10 +1024,12 @@ export async function setBookingOutcome(bookingId: string, outcome: "COMPLETED" 
       // Auto-block a number after N no-shows (Settings.noShowBlockThreshold, 0 = off). [SEC-12]
       const settings = await getSettings(tx);
       if (settings.noShowBlockThreshold > 0) {
+        // Only no-shows for slots after the last unblock count, so unblocking gives a fresh start. [SEC-57]
+        const [cust] = await tx.select({ resetAt: schema.customers.noShowResetAt }).from(schema.customers).where(eq(schema.customers.id, b.customerId));
         const [{ n }] = await tx
           .select({ n: count() })
           .from(schema.bookings)
-          .where(and(eq(schema.bookings.customerId, b.customerId), eq(schema.bookings.status, "NO_SHOW")));
+          .where(and(eq(schema.bookings.customerId, b.customerId), eq(schema.bookings.status, "NO_SHOW"), cust?.resetAt ? gt(schema.bookings.startAt, cust.resetAt) : undefined));
         if (n >= settings.noShowBlockThreshold) {
           const blocked = await tx
             .update(schema.customers)
@@ -1097,6 +1099,24 @@ export async function expireHolds(now = new Date()) {
     .where(and(eq(schema.bookings.status, "PENDING_PAYMENT"), lte(schema.bookings.holdExpiresAt, now)))
     .returning({ id: schema.bookings.id, courtId: schema.bookings.courtId, startAt: schema.bookings.startAt });
   for (const r of rows) await invalidateAvailability(r.courtId, r.startAt);
+  return rows.length;
+}
+
+/**
+ * Cron: confirmed bookings become COMPLETED `autoCompleteHours` (Settings, default 6, 0 = off) after
+ * they end, so reports don't depend on staff marking every game. Never sets NO_SHOW — only staff do,
+ * so auto-blocking counts only staff-marked no-shows. Staff can still switch COMPLETED ↔ NO_SHOW. [SEC-59]
+ */
+export async function autoCompleteBookings(now = new Date()) {
+  const db = await getDb();
+  const settings = await getSettings(db);
+  if (settings.autoCompleteHours <= 0) return 0;
+  const rows = await db
+    .update(schema.bookings)
+    .set({ status: "COMPLETED", updatedAt: now })
+    .where(and(eq(schema.bookings.status, "CONFIRMED"), lte(schema.bookings.endAt, new Date(now.getTime() - settings.autoCompleteHours * 3_600_000))))
+    .returning({ id: schema.bookings.id, code: schema.bookings.bookingCode });
+  if (rows.length) await audit(db, { actor: "system:auto-complete", action: "booking.auto_complete", entity: "Booking", after: { count: rows.length, codes: rows.slice(0, 50).map((r) => r.code), hours: settings.autoCompleteHours } });
   return rows.length;
 }
 

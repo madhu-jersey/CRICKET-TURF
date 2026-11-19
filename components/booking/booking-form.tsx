@@ -31,6 +31,8 @@ type State = {
   terms: boolean;
   idempotencyKey: string;
   hold: HoldResponse | null;
+  /** Set when the server's amounts differ from what the grid showed (price edited meanwhile). [SEC-61] */
+  priceChange?: { total: number; advance: number } | null;
 };
 
 const STORAGE_KEY = "bba-booking-form";
@@ -259,7 +261,11 @@ export function BookingForm({
         window.location.href = `/booking/${hold.bookingCode}?paid=1`;
         return;
       }
-      update({ hold });
+      // The server computes the price; if it differs from what this page showed (the owner changed a
+      // price, or the offer no longer applies), say so and wait for the customer before paying. [SEC-61]
+      const shown = { total: price.total, advance: price.advance };
+      const changed = hold.total !== shown.total || hold.advance !== shown.advance;
+      update({ hold, priceChange: changed ? shown : null });
       goTo(payRef, 0);
     } catch (e) {
       if (e instanceof ApiError && e.code === "SLOT_TAKEN") {
@@ -725,7 +731,15 @@ export function BookingForm({
               <p className="mb-3 text-sm text-zinc-600">
                 Booking <strong className="font-mono" data-testid="hold-code">{s.hold.bookingCode}</strong>
               </p>
-              <PaymentPanel hold={s.hold} autoStart />
+              {s.priceChange && (
+                <div data-testid="price-updated">
+                <Alert tone="warn" className="mb-3">
+                  <strong>Price updated.</strong> This slot now costs {inr(s.hold.total)} (we showed {inr(s.priceChange.total)}). Pay{" "}
+                  {inr(s.hold.advance)} now{s.hold.balance > 0 ? `, ${inr(s.hold.balance)} at the venue` : ""} — or press &ldquo;Start again&rdquo;.
+                </Alert>
+                </div>
+              )}
+              <PaymentPanel hold={s.hold} autoStart={!s.priceChange} />
               <button type="button" onClick={startOver} className="mt-4 w-full py-2 text-center text-sm font-semibold text-zinc-500 underline">
                 Start again
               </button>
