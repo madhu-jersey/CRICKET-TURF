@@ -461,6 +461,8 @@ Found while writing `docs/ARCHITECTURE.md` from the code (SEC-44 → SEC-47); SE
 
 All jobs use mock providers and throwaway databases; no secrets are needed. Reports are uploaded as build artifacts. `.zap/rules.tsv` ignores only informational rules (timestamps, comments in minified bundles) and keeps the `style-src 'unsafe-inline'` finding as a warning (accepted, SEC-30).
 
+**Latest: all 7 jobs pass on `security-hardening` @ 36679c8** (unit, real Postgres, Playwright desktop + mobile, gitleaks, semgrep, npm audit, ZAP).
+
 **CI results (GitHub Actions, 19 Nov 2026)** — runs on `main` @ 28f1efd and `security-hardening` @ 769a45a (P1) and 4647baa (P2):
 
 | Job | Result | Notes |
